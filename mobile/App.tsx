@@ -1,6 +1,7 @@
 import { SpaceGrotesk_500Medium, SpaceGrotesk_700Bold, useFonts } from "@expo-google-fonts/space-grotesk";
 import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar } from "expo-status-bar";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Platform,
@@ -25,6 +26,10 @@ type TerminalSession = {
 
 type ServerMessage =
   | { type: "hello_ack"; deviceId: string }
+  | { type: "approval_required"; message?: string }
+  | { type: "approval_pending"; message?: string }
+  | { type: "approval_granted"; deviceId?: string }
+  | { type: "approval_denied"; message?: string }
   | { type: "sessions"; items: TerminalSession[] }
   | { type: "terminal_started"; session: TerminalSession }
   | { type: "terminal_output"; sessionId: string; output: string }
@@ -59,8 +64,10 @@ export default function App() {
     SpaceGrotesk_700Bold,
   });
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
+  const [pairingToken, setPairingToken] = useState<string>("");
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
   const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [clientId, setClientId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
@@ -71,9 +78,15 @@ export default function App() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const shouldReconnectRef = useRef(false);
+  const shouldResumeReconnectRef = useRef(false);
+  const reconnectBlockedRef = useRef<string | null>(null);
+  const blockedTokenRef = useRef<string | null>(null);
+  const blockNotifiedRef = useRef(false);
   const pendingSendsRef = useRef<Record<string, unknown>[]>([]);
   const connectionRef = useRef<ConnectionState>("disconnected");
   const serverUrlRef = useRef(serverUrl);
+  const pairingTokenRef = useRef(pairingToken);
+  const clientIdRef = useRef<string | null>(null);
   const appStateRef = useRef(AppState.currentState);
 
   const statusLabel = useMemo(() => {
@@ -117,6 +130,22 @@ export default function App() {
       pushLog(`ws <= hello_ack (${message.deviceId.slice(0, 6)})`);
       return;
     }
+    if (message.type === "approval_required") {
+      pushLog("ws <= approval_required");
+      return;
+    }
+    if (message.type === "approval_pending") {
+      pushLog("ws <= approval_pending");
+      return;
+    }
+    if (message.type === "approval_granted") {
+      pushLog("ws <= approval_granted");
+      return;
+    }
+    if (message.type === "approval_denied") {
+      pushLog("ws <= approval_denied");
+      return;
+    }
     if (message.type === "sessions") {
       pushLog(`ws <= sessions (${message.items.length})`);
       return;
@@ -142,8 +171,77 @@ export default function App() {
   };
 
   useEffect(() => {
+    const previous = serverUrlRef.current;
     serverUrlRef.current = serverUrl;
+    if (reconnectBlockedRef.current && previous !== serverUrl) {
+      reconnectBlockedRef.current = null;
+      blockedTokenRef.current = null;
+      blockNotifiedRef.current = false;
+      pushLog("Server updated. Reconnect enabled.");
+      if (shouldResumeReconnectRef.current) {
+        shouldReconnectRef.current = true;
+        shouldResumeReconnectRef.current = false;
+        scheduleReconnect();
+      }
+    }
+    if (previous !== serverUrl) {
+      reconnectAttemptsRef.current = 0;
+    }
   }, [serverUrl]);
+
+  useEffect(() => {
+    const previous = pairingTokenRef.current;
+    pairingTokenRef.current = pairingToken;
+    if (
+      reconnectBlockedRef.current &&
+      blockedTokenRef.current !== null &&
+      pairingToken.trim() &&
+      pairingToken.trim() !== blockedTokenRef.current
+    ) {
+      reconnectBlockedRef.current = null;
+      blockedTokenRef.current = null;
+      blockNotifiedRef.current = false;
+      pushLog("Token updated. Reconnect enabled.");
+      if (shouldResumeReconnectRef.current) {
+        shouldReconnectRef.current = true;
+        shouldResumeReconnectRef.current = false;
+        scheduleReconnect();
+      }
+    }
+    if (previous !== pairingToken) {
+      reconnectAttemptsRef.current = 0;
+    }
+  }, [pairingToken]);
+
+  useEffect(() => {
+    clientIdRef.current = clientId;
+  }, [clientId]);
+
+  useEffect(() => {
+    let active = true;
+    const loadDeviceId = async () => {
+      const stored = await AsyncStorage.getItem("tunnel_device_id");
+      if (!active) return;
+      if (stored) {
+        setClientId(stored);
+        return;
+      }
+      const generated = `device-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      await AsyncStorage.setItem("tunnel_device_id", generated);
+      if (active) {
+        setClientId(generated);
+      }
+    };
+    loadDeviceId().catch(() => {
+      if (active && !clientIdRef.current) {
+        const fallback = `device-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        setClientId(fallback);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     const errorUtils = (globalThis as {
@@ -200,6 +298,14 @@ export default function App() {
     }
   }, [activeSessionId, sessions]);
 
+  useEffect(() => {
+    if (activeSessionId || sessions.length === 0) return;
+    const first = sessions[0];
+    if (!first) return;
+    setActiveSessionId(first.id);
+    requestSnapshot(first.id);
+  }, [activeSessionId, sessions]);
+
   const normalizeUrl = (raw: string) => {
     const trimmed = raw.trim();
     if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
@@ -214,14 +320,51 @@ export default function App() {
     return trimmed;
   };
 
+  const buildWsUrl = (raw: string, token: string) => {
+    const normalized = normalizeUrl(raw);
+    if (!token.trim()) return normalized;
+    try {
+      const url = new URL(normalized);
+      url.searchParams.set("token", token.trim());
+      return url.toString();
+    } catch {
+      return normalized;
+    }
+  };
+
+  const isInvalidTokenText = (value?: string | null) => {
+    if (!value) return false;
+    return value.toLowerCase().includes("invalid token");
+  };
+
   const clearReconnectTimer = () => {
     if (!reconnectTimerRef.current) return;
     clearTimeout(reconnectTimerRef.current);
     reconnectTimerRef.current = null;
   };
 
+  const blockReconnect = (reason: string) => {
+    reconnectBlockedRef.current = reason;
+    blockedTokenRef.current = pairingTokenRef.current.trim();
+    shouldResumeReconnectRef.current = shouldReconnectRef.current;
+    shouldReconnectRef.current = false;
+    blockNotifiedRef.current = false;
+    clearReconnectTimer();
+    if (!blockNotifiedRef.current) {
+      pushLog("Reconnect blocked: invalid token");
+      blockNotifiedRef.current = true;
+    }
+  };
+
   const scheduleReconnect = () => {
     if (!shouldReconnectRef.current) return;
+    if (reconnectBlockedRef.current) {
+      if (!blockNotifiedRef.current) {
+        pushLog("Reconnect paused: invalid token");
+        blockNotifiedRef.current = true;
+      }
+      return;
+    }
     clearReconnectTimer();
     const attempt = reconnectAttemptsRef.current + 1;
     reconnectAttemptsRef.current = attempt;
@@ -258,25 +401,40 @@ export default function App() {
 
   const connect = () => {
     if (connectionRef.current !== "disconnected") return;
+    if (reconnectBlockedRef.current) {
+      const currentToken = pairingTokenRef.current.trim();
+      if (!currentToken || currentToken === blockedTokenRef.current) {
+        if (!blockNotifiedRef.current) {
+          pushLog("Reconnect blocked: invalid token");
+          blockNotifiedRef.current = true;
+        }
+        return;
+      }
+    }
     shouldReconnectRef.current = true;
     clearReconnectTimer();
     const rawUrl = serverUrlRef.current;
+    const resolvedUrl = buildWsUrl(rawUrl, pairingTokenRef.current);
     const normalized = normalizeUrl(rawUrl);
     if (normalized !== rawUrl) {
       setServerUrl(normalized);
     }
 
-    pushLog(`Connecting to ${normalized}`);
+    pushLog(`Connecting to ${resolvedUrl}`);
     updateConnection("connecting");
-    const socket = new WebSocket(normalized);
+    const socket = new WebSocket(resolvedUrl);
     socketRef.current = socket;
 
     socket.onopen = () => {
       if (socketRef.current !== socket) return;
       updateConnection("connected");
       reconnectAttemptsRef.current = 0;
+      reconnectBlockedRef.current = null;
+      blockedTokenRef.current = null;
+      blockNotifiedRef.current = false;
+      shouldResumeReconnectRef.current = false;
       const deviceName = `${Platform.OS}-mobile`;
-      const helloPayload = { type: "hello", deviceName };
+      const helloPayload = { type: "hello", deviceName, deviceId: clientIdRef.current };
       const listPayload = { type: "list_sessions" };
       socket.send(JSON.stringify(helloPayload));
       logOutbound(helloPayload, false);
@@ -293,6 +451,16 @@ export default function App() {
         logInbound(message);
         if (message.type === "hello_ack") {
           setDeviceId(message.deviceId);
+        } else if (message.type === "approval_required") {
+          pushLog(message.message ?? "Approval required by IDE");
+        } else if (message.type === "approval_pending") {
+          pushLog(message.message ?? "Waiting for approval");
+        } else if (message.type === "approval_granted") {
+          pushLog("Device approved");
+          requestSessions();
+        } else if (message.type === "approval_denied") {
+          pushLog(message.message ?? "Device denied");
+          disconnect();
         } else if (message.type === "sessions") {
           setSessions(message.items);
         } else if (message.type === "terminal_started") {
@@ -319,6 +487,9 @@ export default function App() {
           pushLog(`Terminal: ${message.message}`);
         } else if (message.type === "error") {
           pushLog(`Server error: ${message.message}`);
+          if (isInvalidTokenText(message.message)) {
+            blockReconnect(message.message);
+          }
         }
       } catch {
         pushLog("Received unparseable message");
@@ -335,6 +506,10 @@ export default function App() {
       setTerminalOutputs({});
       const reason = event.reason ? `: ${event.reason}` : "";
       pushLog(`Socket disconnected (${event.code}${reason})`);
+      if (isInvalidTokenText(event.reason)) {
+        blockReconnect(event.reason || "invalid token");
+        return;
+      }
       scheduleReconnect();
     };
 
@@ -363,9 +538,7 @@ export default function App() {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       queueSend(payload);
-      if (connectionRef.current === "disconnected") {
-        connect();
-      }
+      scheduleReconnect();
       return;
     }
     socket.send(JSON.stringify(payload));
@@ -421,6 +594,15 @@ export default function App() {
               placeholder="ws://host:8765/ws"
               placeholderTextColor="rgba(248, 250, 252, 0.4)"
             />
+            <TextInput
+              style={styles.input}
+              value={pairingToken}
+              onChangeText={setPairingToken}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="pairing token"
+              placeholderTextColor="rgba(248, 250, 252, 0.4)"
+            />
             <View style={styles.buttonRow}>
               <Pressable
                 style={[styles.button, styles.buttonPrimary, connection !== "disconnected" && styles.buttonDisabled]}
@@ -452,33 +634,29 @@ export default function App() {
             {sessions.length === 0 ? (
               <Text style={styles.muted}>No sessions reported yet.</Text>
             ) : (
-              sessions.map((session) => (
-                <View key={session.id} style={styles.sessionRow}>
-                  <View style={styles.sessionMeta}>
-                    <Text style={styles.sessionName}>{session.name}</Text>
-                    <Text style={styles.sessionDetail}>{session.workingDirectory}</Text>
-                  </View>
-                  <View style={styles.sessionActions}>
-                    <Pressable
-                      style={[
-                        styles.chip,
-                        activeSessionId === session.id && styles.chipActive,
-                      ]}
-                      onPress={() => {
-                        setActiveSessionId(session.id);
-                        requestSnapshot(session.id);
-                      }}
-                    >
-                      <Text style={styles.chipText}>
-                        {activeSessionId === session.id ? "Viewing" : "View"}
-                      </Text>
-                    </Pressable>
-                    <Pressable style={[styles.chip, styles.chipDanger]} onPress={() => closeSession(session.id)}>
-                      <Text style={styles.chipText}>Close</Text>
-                    </Pressable>
-                  </View>
-                </View>
-              ))
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.tabsRow}
+              >
+                {sessions.map((session) => (
+                  <Pressable
+                    key={session.id}
+                    style={[
+                      styles.tab,
+                      activeSessionId === session.id && styles.tabActive,
+                    ]}
+                    onPress={() => {
+                      setActiveSessionId(session.id);
+                      requestSnapshot(session.id);
+                    }}
+                  >
+                    <Text style={styles.tabTitle} numberOfLines={1}>
+                      {session.name}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
             )}
           </View>
 
@@ -486,7 +664,20 @@ export default function App() {
             <Text style={styles.cardTitle}>Terminal output</Text>
             {activeSession ? (
               <>
-                <Text style={styles.muted}>Session: {activeSession.name}</Text>
+                <View style={styles.outputHeader}>
+                  <View style={styles.outputHeaderMeta}>
+                    <Text style={styles.muted}>Session: {activeSession.name}</Text>
+                    <Text style={styles.outputPath} numberOfLines={1}>
+                      {activeSession.workingDirectory}
+                    </Text>
+                  </View>
+                  <Pressable
+                    style={[styles.button, styles.buttonDangerOutline]}
+                    onPress={() => closeSession(activeSession.id)}
+                  >
+                    <Text style={styles.buttonText}>Close</Text>
+                  </Pressable>
+                </View>
                 <View style={styles.outputBox}>
                   <Text style={styles.outputText}>{activeOutput || "No output yet."}</Text>
                 </View>
@@ -638,46 +829,43 @@ const styles = StyleSheet.create({
     fontFamily: "SpaceGrotesk_500Medium",
     color: THEME.colors.muted,
   },
-  sessionRow: {
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: "rgba(248, 250, 252, 0.08)",
-    gap: 8,
-  },
-  sessionMeta: {
-    gap: 2,
-  },
-  sessionName: {
-    fontFamily: "SpaceGrotesk_700Bold",
-    color: THEME.colors.text,
-    fontSize: 15,
-  },
-  sessionDetail: {
-    fontFamily: "SpaceGrotesk_500Medium",
-    color: THEME.colors.muted,
-    fontSize: 12,
-  },
-  sessionActions: {
+  tabsRow: {
     flexDirection: "row",
-    gap: 8,
+    gap: 12,
+    paddingVertical: 4,
   },
-  chip: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 999,
+  tab: {
+    minWidth: 140,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+    gap: 4,
   },
-  chipActive: {
-    backgroundColor: "rgba(249, 115, 22, 0.2)",
+  tabActive: {
     borderColor: THEME.colors.primary,
+    backgroundColor: "rgba(249, 115, 22, 0.18)",
   },
-  chipDanger: {
-    borderColor: "rgba(239, 68, 68, 0.6)",
-  },
-  chipText: {
+  tabTitle: {
     fontFamily: "SpaceGrotesk_700Bold",
     color: THEME.colors.text,
+    fontSize: 13,
+  },
+  outputHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  outputHeaderMeta: {
+    flex: 1,
+    gap: 2,
+  },
+  outputPath: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.muted,
     fontSize: 12,
   },
   outputBox: {
@@ -710,5 +898,10 @@ const styles = StyleSheet.create({
     fontFamily: "SpaceGrotesk_500Medium",
     color: THEME.colors.muted,
     paddingVertical: 2,
+  },
+  buttonDangerOutline: {
+    borderWidth: 1,
+    borderColor: "rgba(239, 68, 68, 0.7)",
+    backgroundColor: "rgba(239, 68, 68, 0.15)",
   },
 });

@@ -7,6 +7,7 @@ data class ServerInfo(
     val wsUrl: String,
     val port: Int,
     val hostAddress: String,
+    val pairingToken: String,
 )
 
 data class DeviceInfo(

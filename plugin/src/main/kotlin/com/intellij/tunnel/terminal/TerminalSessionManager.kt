@@ -6,6 +6,10 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.registry.Registry
+import com.intellij.terminal.JBTerminalWidget
+import com.intellij.terminal.ui.TerminalWidget
+import org.jetbrains.plugins.terminal.LocalBlockTerminalRunner
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
 import java.time.Instant
@@ -63,6 +67,41 @@ class TerminalSessionManager {
         }
     }
 
+    private inner class TerminalWidgetBackend(
+        val widget: TerminalWidget,
+        val jediWidget: JBTerminalWidget?,
+    ) : SessionBackend {
+        override fun sendInput(data: String) {
+            ApplicationManager.getApplication().invokeLater {
+                widget.ttyConnectorAccessor.executeWithTtyConnector { connector ->
+                    try {
+                        connector.write(data)
+                    } catch (_: Exception) {
+                        // Ignore terminal write failures.
+                    }
+                }
+            }
+        }
+
+        override fun snapshot(): String {
+            val widget = jediWidget
+            if (widget != null) {
+                return runOnEdt { widget.text }
+            }
+            return "Terminal output unavailable for the new terminal UI. Disable 'terminal.new.ui' and retry."
+        }
+
+        override fun close() {
+            ApplicationManager.getApplication().invokeLater {
+                Disposer.dispose(widget)
+            }
+        }
+
+        override fun isDisposed(): Boolean {
+            return isDisposed(widget)
+        }
+    }
+
     private class InMemoryTerminalBackend : SessionBackend {
         private val lock = Any()
         private val output = StringBuilder()
@@ -96,6 +135,7 @@ class TerminalSessionManager {
     private val sessions = ConcurrentHashMap<String, Session>()
 
     fun listSessions(): List<Session> {
+        syncExistingSessions()
         cleanupDisposed()
         return sessions.values.sortedBy { it.createdAt }
     }
@@ -120,21 +160,7 @@ class TerminalSessionManager {
         } else {
             val widget = runCatching {
                 runOnEdtWithTimeout(10_000) {
-                    val terminalManager = TerminalToolWindowManager.getInstance(project)
-                    val terminalWidget = terminalManager.createShellWidget(sessionDirectory, sessionName, false, false)
-                    if (terminalWidget == null) {
-                        logger.warn("createSession: terminal widget null id=$sessionId")
-                        throw IllegalStateException("Terminal widget unavailable. Open the Terminal tool window and retry.")
-                    }
-                    logger.info("createSession: terminal widget class=${terminalWidget.javaClass.name} id=$sessionId")
-                    runCatching { ShellTerminalWidget.toShellJediTermWidgetOrThrow(terminalWidget) }
-                        .onFailure { error ->
-                            logger.warn(
-                                "createSession: failed to convert terminal widget id=$sessionId class=${terminalWidget.javaClass.name}",
-                                error,
-                            )
-                        }
-                        .getOrThrow()
+                    createClassicShellWidget(project, sessionDirectory, sessionName, sessionId)
                 }
             }.onFailure { error ->
                 logger.warn("createSession: failed to create terminal widget id=$sessionId", error)
@@ -201,7 +227,7 @@ class TerminalSessionManager {
     }
 
     private fun resolveProject(): Project? {
-        val projects = ProjectManager.getInstance().openProjects
+        val projects = openProjects()
         if (projects.isEmpty()) {
             logger.info("resolveProject: no open projects")
             return null
@@ -213,6 +239,132 @@ class TerminalSessionManager {
             logger.info("resolveProject: project disposed name=${project.name}")
         }
         return project
+    }
+
+    private fun openProjects(): List<Project> {
+        return ProjectManager.getInstance().openProjects.filterNot { it.isDisposed }
+    }
+
+    private fun createClassicShellWidget(
+        project: Project,
+        workingDirectory: String,
+        tabName: String,
+        sessionId: String,
+    ): ShellTerminalWidget {
+        val terminalManager = TerminalToolWindowManager.getInstance(project)
+        val registry = Registry.get(LocalBlockTerminalRunner.BLOCK_TERMINAL_REGISTRY)
+        val wasBlockUiEnabled = registry.asBoolean()
+        if (wasBlockUiEnabled) {
+            logger.info("createSession: disabling new terminal UI id=$sessionId")
+            registry.setValue(false)
+        }
+        try {
+            val terminalWidget = terminalManager.createShellWidget(workingDirectory, tabName, false, false)
+            logger.info("createSession: terminal widget class=${terminalWidget.javaClass.name} id=$sessionId")
+            return ShellTerminalWidget.asShellJediTermWidget(terminalWidget)
+                ?: throw IllegalStateException(
+                    "New Terminal UI is enabled. Disable 'terminal.new.ui' to create tunnel terminal sessions.",
+                )
+        } finally {
+            if (wasBlockUiEnabled) {
+                registry.setValue(true)
+                logger.info("createSession: restored new terminal UI flag id=$sessionId")
+            }
+        }
+    }
+
+    private fun syncExistingSessions() {
+        if (ApplicationManager.getApplication().isUnitTestMode) return
+        val projects = openProjects()
+        if (projects.isEmpty()) return
+        runOnEdt {
+            projects.forEach { project ->
+                val terminalManager = TerminalToolWindowManager.getInstance(project)
+                val nameByWidget = mutableMapOf<TerminalWidget, String>()
+                val toolWindow = terminalManager.toolWindow
+                if (toolWindow == null) {
+                    logger.info("syncExistingSessions: terminal tool window not initialized project=${project.name}")
+                } else {
+                    toolWindow.contentManager.contents.forEach { content ->
+                        val terminalWidget = TerminalToolWindowManager.findWidgetByContent(content) ?: return@forEach
+                        val displayName = content.displayName?.takeIf { it.isNotBlank() }
+                        if (displayName != null) {
+                            nameByWidget[terminalWidget] = displayName
+                        }
+                    }
+                }
+
+                val widgets = terminalManager.terminalWidgets
+                val fallbackWidgets = terminalManager.widgets
+                if (widgets.isEmpty() && fallbackWidgets.isEmpty() && nameByWidget.isEmpty()) {
+                    return@forEach
+                }
+                val terminalWidgets = if (widgets.isNotEmpty()) {
+                    widgets
+                } else if (fallbackWidgets.isNotEmpty()) {
+                    fallbackWidgets.map { it.asNewWidget() }.toSet()
+                } else {
+                    nameByWidget.keys
+                }
+
+                terminalWidgets.forEach { terminalWidget ->
+                    val existing = sessions.values.any { session ->
+                        val backend = session.backend
+                        when (backend) {
+                            is IdeaTerminalBackend -> backend.widget == ShellTerminalWidget.asShellJediTermWidget(terminalWidget)
+                            is TerminalWidgetBackend -> backend.widget == terminalWidget
+                            else -> false
+                        }
+                    }
+                    if (existing) return@forEach
+
+                    val shellWidget = ShellTerminalWidget.asShellJediTermWidget(terminalWidget)
+                    val sessionId = if (shellWidget != null) {
+                        "external-${project.name}-${System.identityHashCode(shellWidget)}"
+                    } else {
+                        "external-${project.name}-${System.identityHashCode(terminalWidget)}"
+                    }
+                    val sessionName = nameByWidget[terminalWidget]
+                        ?: terminalWidget.terminalTitle.buildTitle().takeIf { it.isNotBlank() }
+                        ?: "Terminal"
+                    val workingDirectory = shellWidget?.startupOptions?.workingDirectory
+                        ?: project.basePath
+                        ?: "."
+                    val backend = if (shellWidget != null) {
+                        IdeaTerminalBackend(shellWidget)
+                    } else {
+                        val jediWidget = JBTerminalWidget.asJediTermWidget(terminalWidget)
+                        if (jediWidget == null) {
+                            logger.info("syncExistingSessions: new terminal widget detected name=$sessionName project=${project.name}")
+                        }
+                        TerminalWidgetBackend(terminalWidget, jediWidget)
+                    }
+                    val session = Session(
+                        id = sessionId,
+                        name = sessionName,
+                        workingDirectory = workingDirectory,
+                        createdAt = Instant.now(),
+                        backend = backend,
+                    )
+                    if (sessions.putIfAbsent(sessionId, session) == null) {
+                        logger.info("syncExistingSessions: adopted terminal id=$sessionId name=$sessionName project=${project.name}")
+                        val disposable = when (backend) {
+                            is IdeaTerminalBackend -> backend.widget
+                            is TerminalWidgetBackend -> backend.widget
+                            else -> null
+                        }
+                        if (disposable != null) {
+                            Disposer.register(disposable, object : Disposable {
+                                override fun dispose() {
+                                    sessions.remove(sessionId)
+                                    logger.info("Session disposed: id=$sessionId")
+                                }
+                            })
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun cleanupDisposed() {
