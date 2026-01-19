@@ -1,0 +1,18 @@
+<idea-plugin>
+    <id>com.intellij.tunnel</id>
+    <name>IntelliJ Tunnel</name>
+    <vendor>Local</vendor>
+    <description><![CDATA[
+        Lightweight tunnel service to expose terminal sessions and build status to mobile clients.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+    <depends>com.jetbrains.sh</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Tunnel" anchor="right" factoryClass="com.intellij.tunnel.ui.TunnelToolWindowFactory" />
+        <applicationService serviceImplementation="com.intellij.tunnel.server.TunnelServerService" />
+        <postStartupActivity implementation="com.intellij.tunnel.startup.TunnelStartupActivity" />
+    </extensions>
+</idea-plugin>

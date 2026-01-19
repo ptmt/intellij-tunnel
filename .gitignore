@@ -1,0 +1,28 @@
+.DS_Store
+
+# JetBrains / IntelliJ
+.idea/
+*.iml
+
+# Gradle / JVM
+.gradle/
+**/build/
+**/out/
+.intellijPlatform/
+
+# Expo / React Native
+/mobile/node_modules/
+/mobile/.expo/
+/mobile/.expo-shared/
+/mobile/.cache/
+/mobile/coverage/
+/mobile/dist/
+/mobile/build/
+/mobile/web-build/
+/mobile/npm-debug.log*
+/mobile/yarn-debug.log*
+/mobile/yarn-error.log*
+/mobile/pnpm-debug.log*
+/mobile/.env
+/mobile/.env.*
+!/mobile/.env.example

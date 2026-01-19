@@ -1,0 +1,10 @@
+{
+  "expo": {
+    "name": "IntelliJ Tunnel",
+    "slug": "intellij-tunnel",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "platforms": ["ios", "android", "web"]
+  }
+}
