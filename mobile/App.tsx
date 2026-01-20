@@ -76,7 +76,6 @@ const STORAGE_KEYS = {
   activeSession: "tunnel_active_session",
   connectionHistory: "tunnel_connection_history",
   terminalOutputs: "tunnel_terminal_outputs",
-  terminalCacheUpdatedAt: "tunnel_terminal_cache_updated_at",
 };
 
 export default function App() {
@@ -91,7 +90,7 @@ export default function App() {
   const [connectionModalVisible, setConnectionModalVisible] = useState(false);
   const [settingsReady, setSettingsReady] = useState(false);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
-  const [cacheUpdatedAt, setCacheUpdatedAt] = useState<string | null>(null);
+  const [reconnectPending, setReconnectPending] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [clientId, setClientId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>("terminal");
@@ -114,34 +113,26 @@ export default function App() {
   const serverUrlRef = useRef(serverUrl);
   const pairingTokenRef = useRef(pairingToken);
   const invalidTokenHandledRef = useRef(false);
+  const autoConnectAttemptedRef = useRef(false);
   const clientIdRef = useRef<string | null>(null);
   const subscribedSessionRef = useRef<string | null>(null);
   const appStateRef = useRef(AppState.currentState);
   const settingsLoadedRef = useRef(false);
 
+  const isConnectingStatus = connection === "connecting" || (reconnectPending && connection !== "connected");
   const statusLabel = useMemo(() => {
-    switch (connection) {
-      case "connected":
-        return "Connected";
-      case "connecting":
-        return "Connecting";
-      default:
-        return "Disconnected";
-    }
-  }, [connection]);
+    if (connection === "connected") return "Connected";
+    if (isConnectingStatus) return "Connecting";
+    return "Disconnected";
+  }, [connection, isConnectingStatus]);
 
   const statusColor = useMemo(() => {
-    switch (connection) {
-      case "connected":
-        return THEME.colors.success;
-      case "connecting":
-        return THEME.colors.warning;
-      default:
-        return THEME.colors.danger;
-    }
-  }, [connection]);
+    if (connection === "connected") return THEME.colors.success;
+    if (isConnectingStatus) return THEME.colors.warning;
+    return THEME.colors.danger;
+  }, [connection, isConnectingStatus]);
 
-  const buildHistoryId = (url: string, token: string) => `${url}::${token}`;
+  const buildHistoryId = (url: string) => normalizeUrl(url).trim();
   const shouldForceConnectionModal =
     settingsReady && connectionHistory.length === 0 && connection !== "connected";
   const connectionModalOpen = connectionModalVisible || shouldForceConnectionModal;
@@ -153,19 +144,9 @@ export default function App() {
     const stamp = date.toISOString().slice(0, 16).replace("T", " ");
     return `Last used: ${stamp}Z`;
   };
-  const formatCacheUpdatedAt = (value?: string | null) => {
-    if (!value) return "Read-only cache";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime()) || date.getTime() <= 0) {
-      return "Read-only cache";
-    }
-    const stamp = date.toISOString().slice(0, 16).replace("T", " ");
-    return `Read-only cache · ${stamp}Z`;
-  };
   const canInteract = connection === "connected";
   const hasCachedSessions = sessions.length > 0;
   const showCachedContent = connection === "disconnected" && hasCachedSessions;
-  const isReadOnly = showCachedContent;
   const isLoading = connection === "connecting" || (canInteract && !sessionsLoaded);
 
   const pushLog = (entry: string) => {
@@ -305,6 +286,15 @@ export default function App() {
   }, [connection]);
 
   useEffect(() => {
+    if (!settingsReady) return;
+    if (autoConnectAttemptedRef.current) return;
+    if (connectionRef.current !== "disconnected") return;
+    if (connectionHistory.length === 0) return;
+    autoConnectAttemptedRef.current = true;
+    connectWithHistory(connectionHistory[0]);
+  }, [connectionHistory, settingsReady]);
+
+  useEffect(() => {
     let active = true;
     const loadSettings = async () => {
       const entries = await AsyncStorage.multiGet([
@@ -314,7 +304,6 @@ export default function App() {
         STORAGE_KEYS.activeSession,
         STORAGE_KEYS.connectionHistory,
         STORAGE_KEYS.terminalOutputs,
-        STORAGE_KEYS.terminalCacheUpdatedAt,
       ]);
       if (!active) return;
       const stored = Object.fromEntries(entries);
@@ -369,16 +358,37 @@ export default function App() {
                 const token = item.pairingToken.trim();
                 if (!url || !token) return null;
                 const lastUsed = typeof item.lastUsed === "string" ? item.lastUsed : new Date(0).toISOString();
+                const id = buildHistoryId(url);
                 return {
-                  id: buildHistoryId(url, token),
-                  serverUrl: url,
+                  id,
+                  serverUrl: normalizeUrl(url).trim(),
                   pairingToken: token,
                   lastUsed,
                 };
               })
               .filter((item): item is ConnectionHistoryItem => Boolean(item));
+            const uniqueByUrl = new Map<string, ConnectionHistoryItem>();
+            safeHistory.forEach((item) => {
+              const existing = uniqueByUrl.get(item.id);
+              if (!existing) {
+                uniqueByUrl.set(item.id, item);
+                return;
+              }
+              const existingTime = Date.parse(existing.lastUsed) || 0;
+              const nextTime = Date.parse(item.lastUsed) || 0;
+              if (nextTime > existingTime) {
+                uniqueByUrl.set(item.id, item);
+              }
+            });
+            const deduped = Array.from(uniqueByUrl.values())
+              .sort((a, b) => {
+                const timeA = Date.parse(a.lastUsed) || 0;
+                const timeB = Date.parse(b.lastUsed) || 0;
+                return timeB - timeA;
+              })
+              .slice(0, HISTORY_LIMIT);
             if (active) {
-              setConnectionHistory(safeHistory);
+              setConnectionHistory(deduped);
             }
           }
         } catch {
@@ -400,10 +410,6 @@ export default function App() {
         } catch {
           // Ignore invalid cached output.
         }
-      }
-      const storedCacheUpdatedAt = stored[STORAGE_KEYS.terminalCacheUpdatedAt];
-      if (storedCacheUpdatedAt && active) {
-        setCacheUpdatedAt(storedCacheUpdatedAt);
       }
     };
     loadSettings().catch(() => {
@@ -584,16 +590,25 @@ export default function App() {
     return value.toLowerCase() === "invalid_token";
   };
 
+  const filterTerminalOutput = (value: string) => {
+    const removeNeedle =
+      "Unable to proceed. Could not locate working directory.: No such file or directory (os error 2)";
+    return value
+      .split(/\r?\n/)
+      .filter((line) => !line.includes(removeNeedle))
+      .join("\n");
+  };
+
   const updateConnectionHistory = (rawUrl: string, rawToken: string) => {
     const normalizedUrl = normalizeUrl(rawUrl).trim();
     const token = rawToken.trim();
     if (!normalizedUrl || !token) return;
-    const id = buildHistoryId(normalizedUrl, token);
+    const id = buildHistoryId(normalizedUrl);
     const now = new Date().toISOString();
     setConnectionHistory((prev) => {
       const next = [
         { id, serverUrl: normalizedUrl, pairingToken: token, lastUsed: now },
-        ...prev.filter((item) => item.id !== id),
+        ...prev.filter((item) => buildHistoryId(item.serverUrl) !== id),
       ].slice(0, HISTORY_LIMIT);
       AsyncStorage.setItem(STORAGE_KEYS.connectionHistory, JSON.stringify(next)).catch(() => {
         // Ignore storage errors.
@@ -602,21 +617,12 @@ export default function App() {
     });
   };
 
-  const touchCacheUpdatedAt = () => {
-    const now = new Date().toISOString();
-    setCacheUpdatedAt(now);
-    AsyncStorage.setItem(STORAGE_KEYS.terminalCacheUpdatedAt, now).catch(() => {
-      // Ignore storage errors.
-    });
-  };
-
-  const removeConnectionHistory = (rawUrl: string, rawToken: string) => {
+  const removeConnectionHistory = (rawUrl: string) => {
     const normalizedUrl = normalizeUrl(rawUrl).trim();
-    const token = rawToken.trim();
-    if (!normalizedUrl || !token) return;
-    const id = buildHistoryId(normalizedUrl, token);
+    if (!normalizedUrl) return;
+    const id = buildHistoryId(normalizedUrl);
     setConnectionHistory((prev) => {
-      const next = prev.filter((item) => item.id !== id);
+      const next = prev.filter((item) => buildHistoryId(item.serverUrl) !== id);
       AsyncStorage.setItem(STORAGE_KEYS.connectionHistory, JSON.stringify(next)).catch(() => {
         // Ignore storage errors.
       });
@@ -627,9 +633,10 @@ export default function App() {
   const handleInvalidToken = (reason?: string, code?: string) => {
     if (invalidTokenHandledRef.current) return;
     invalidTokenHandledRef.current = true;
+    setReconnectPending(false);
     blockReconnect(reason ?? code ?? "invalid token");
     shouldResumeReconnectRef.current = false;
-    removeConnectionHistory(serverUrlRef.current, pairingTokenRef.current);
+    removeConnectionHistory(serverUrlRef.current);
     setPairingToken("");
     AsyncStorage.removeItem(STORAGE_KEYS.pairingToken).catch(() => {
       // Ignore storage errors.
@@ -715,6 +722,7 @@ export default function App() {
     invalidTokenHandledRef.current = false;
     setSessionsLoaded(false);
     shouldReconnectRef.current = true;
+    setReconnectPending(true);
     clearReconnectTimer();
     const rawUrl = serverUrlRef.current;
     const resolvedUrl = buildWsUrl(rawUrl, pairingTokenRef.current);
@@ -769,16 +777,14 @@ export default function App() {
         } else if (message.type === "sessions") {
           setSessions(message.items);
           setSessionsLoaded(true);
-          touchCacheUpdatedAt();
         } else if (message.type === "terminal_started") {
           setSessions((prev) => [...prev, message.session]);
           setActiveSessionId(message.session.id);
           send({ type: "terminal_snapshot", sessionId: message.session.id, lines: 200 });
           pushLog(`Terminal started: ${message.session.name}`);
-          touchCacheUpdatedAt();
+          setSessionsLoaded(true);
         } else if (message.type === "terminal_output") {
           setTerminalOutputs((prev) => ({ ...prev, [message.sessionId]: message.output }));
-          touchCacheUpdatedAt();
         } else if (message.type === "terminal_closed") {
           setSessions((prev) => prev.filter((session) => session.id !== message.sessionId));
           setTerminalOutputs((prev) => {
@@ -787,7 +793,7 @@ export default function App() {
             return next;
           });
           setActiveSessionId((current) => (current === message.sessionId ? null : current));
-          touchCacheUpdatedAt();
+          setSessionsLoaded(true);
         } else if (message.type === "build_status") {
           setBuildStatus(message.status);
           if (message.message) {
@@ -833,6 +839,8 @@ export default function App() {
   const disconnect = () => {
     pushLog("Disconnect requested");
     shouldReconnectRef.current = false;
+    autoConnectAttemptedRef.current = true;
+    setReconnectPending(false);
     reconnectAttemptsRef.current = 0;
     clearReconnectTimer();
     pendingSendsRef.current = [];
@@ -905,15 +913,18 @@ export default function App() {
     if (connectionRef.current !== "connected") return;
     send({ type: "terminal_snapshot", sessionId, lines: 200 });
   };
-  const sendCommand = () => {
+  const sendCommand = (appendNewline: boolean) => {
     if (connectionRef.current !== "connected") return;
     if (!activeSessionId) return;
     const data = command;
     if (!data.trim()) return;
-    send({ type: "terminal_input", sessionId: activeSessionId, data });
+    const payload = appendNewline ? `${data}\n` : data;
+    send({ type: "terminal_input", sessionId: activeSessionId, data: payload });
     setCommand("");
     requestSnapshot(activeSessionId);
   };
+  const submitCommand = () => sendCommand(true);
+  const sendRawCommand = () => sendCommand(false);
   const triggerBuild = () => {
     if (connectionRef.current !== "connected") return;
     send({ type: "build_project" });
@@ -922,6 +933,7 @@ export default function App() {
   const displaySessions = canInteract || showCachedContent ? sessions : [];
   const displayActiveSessionId = canInteract || showCachedContent ? activeSessionId : null;
   const activeOutput = displayActiveSessionId ? terminalOutputs[displayActiveSessionId] ?? "" : "";
+  const displayOutput = filterTerminalOutput(activeOutput);
   const activeSession = displayActiveSessionId
     ? displaySessions.find((session) => session.id === displayActiveSessionId) ?? null
     : null;
@@ -932,9 +944,6 @@ export default function App() {
     }
     if (canInteract && sessionsLoaded && displaySessions.length === 0) {
       return "No terminals yet. Start one from the IDE.";
-    }
-    if (showCachedContent && displaySessions.length === 0) {
-      return "No cached terminals yet.";
     }
     return "Select a session to view output.";
   })();
@@ -1010,6 +1019,7 @@ export default function App() {
                   <Pressable
                     style={[styles.button, styles.buttonPrimary, connection !== "disconnected" && styles.buttonDisabled]}
                     onPress={connect}
+                    disabled={connection !== "disconnected"}
                   >
                     <Text style={styles.buttonText}>Connect</Text>
                   </Pressable>
@@ -1045,7 +1055,7 @@ export default function App() {
                         </Pressable>
                         <Pressable
                           style={styles.historyDelete}
-                          onPress={() => removeConnectionHistory(item.serverUrl, item.pairingToken)}
+                          onPress={() => removeConnectionHistory(item.serverUrl)}
                         >
                           <Text style={styles.historyDeleteText}>Remove</Text>
                         </Pressable>
@@ -1079,33 +1089,39 @@ export default function App() {
             {activeTab === "terminal" ? (
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Terminal</Text>
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.tabsRow}
-                >
-                  {sessions.map((session) => (
-                    <Pressable
-                      key={session.id}
-                      style={[
-                        styles.tab,
-                        activeSessionId === session.id && styles.tabActive,
-                      ]}
-                      onPress={() => {
-                        setActiveSessionId(session.id);
-                        requestSnapshot(session.id);
-                      }}
-                    >
-                      <Text style={styles.tabTitle} numberOfLines={1}>
-                        {session.name}
-                      </Text>
-                    </Pressable>
-                  ))}
-                  <Pressable style={[styles.tab, styles.tabAdd]} onPress={startSession}>
-                    <Text style={styles.tabAddText}>+</Text>
-                  </Pressable>
-                </ScrollView>
-                {activeSession ? (
+                {!isLoading && (canInteract || showCachedContent) ? (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.tabsRow}
+                  >
+                    {displaySessions.map((session) => (
+                      <Pressable
+                        key={session.id}
+                        style={[
+                          styles.tab,
+                          displayActiveSessionId === session.id && styles.tabActive,
+                        ]}
+                        onPress={() => {
+                          setActiveSessionId(session.id);
+                          if (canInteract) {
+                            requestSnapshot(session.id);
+                          }
+                        }}
+                      >
+                        <Text style={styles.tabTitle} numberOfLines={1}>
+                          {session.name}
+                        </Text>
+                      </Pressable>
+                    ))}
+                    {canInteract ? (
+                      <Pressable style={[styles.tab, styles.tabAdd]} onPress={startSession}>
+                        <Text style={styles.tabAddText}>+</Text>
+                      </Pressable>
+                    ) : null}
+                  </ScrollView>
+                ) : null}
+                {activeSession && !isLoading ? (
                   <>
                     <View style={styles.outputHeader}>
                       <View style={styles.outputHeaderMeta}>
@@ -1114,19 +1130,21 @@ export default function App() {
                           {activeSession.workingDirectory}
                         </Text>
                       </View>
-                      <Pressable
-                        style={[styles.button, styles.buttonDangerOutline]}
-                        onPress={() => closeSession(activeSession.id)}
-                      >
-                        <Text style={styles.buttonText}>Close</Text>
-                      </Pressable>
+                      {canInteract ? (
+                        <Pressable
+                          style={[styles.button, styles.buttonDangerOutline]}
+                          onPress={() => closeSession(activeSession.id)}
+                        >
+                          <Text style={styles.buttonText}>Close</Text>
+                        </Pressable>
+                      ) : null}
                     </View>
                     <ScrollView
                       style={styles.outputScroll}
                       contentContainerStyle={styles.outputScrollContent}
                       nestedScrollEnabled
                     >
-                      <Text style={styles.outputText}>{activeOutput || "No output yet."}</Text>
+                      <Text style={styles.outputText}>{displayOutput || "No output yet."}</Text>
                     </ScrollView>
                     <View style={styles.commandRow}>
                       <TextInput
@@ -1135,29 +1153,44 @@ export default function App() {
                         onChangeText={setCommand}
                         autoCapitalize="none"
                         autoCorrect={false}
+                        blurOnSubmit={false}
+                        returnKeyType="send"
+                        onSubmitEditing={submitCommand}
                         placeholder="Enter command"
                         placeholderTextColor="rgba(248, 250, 252, 0.4)"
+                        editable={canInteract}
+                        selectTextOnFocus={canInteract}
                       />
-                      <View style={styles.micButton}>
-                        <View style={styles.micIcon}>
-                          <View style={styles.micHead} />
-                          <View style={styles.micStem} />
-                          <View style={styles.micBase} />
-                        </View>
-                      </View>
                       <Pressable
-                        style={[styles.button, styles.buttonPrimary, !command.trim() && styles.buttonDisabled]}
-                        onPress={sendCommand}
+                        style={[
+                          styles.micButton,
+                          (!canInteract || !command.trim()) && styles.commandButtonDisabled,
+                        ]}
+                        onPress={sendRawCommand}
+                        disabled={!canInteract || !command.trim()}
+                      >
+                        <Text style={styles.micButtonText}>Type</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          styles.button,
+                          styles.buttonPrimary,
+                          (!canInteract || !command.trim()) && styles.buttonDisabled,
+                        ]}
+                        onPress={submitCommand}
+                        disabled={!canInteract || !command.trim()}
                       >
                         <Text style={styles.buttonText}>Send</Text>
                       </Pressable>
                     </View>
-                    <Pressable
-                      style={[styles.button, styles.buttonSecondary]}
-                      onPress={() => requestSnapshot(activeSession.id)}
-                    >
-                      <Text style={styles.buttonText}>Refresh output</Text>
-                    </Pressable>
+                    {canInteract ? (
+                      <Pressable
+                        style={[styles.button, styles.buttonSecondary]}
+                        onPress={() => requestSnapshot(activeSession.id)}
+                      >
+                        <Text style={styles.buttonText}>Refresh output</Text>
+                      </Pressable>
+                    ) : null}
                   </>
                 ) : (
                   <Text style={styles.muted}>{emptyTerminalMessage}</Text>
@@ -1539,28 +1572,13 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  micIcon: {
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 2,
+  micButtonText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 12,
   },
-  micHead: {
-    width: 12,
-    height: 16,
-    borderRadius: 6,
-    backgroundColor: THEME.colors.text,
-  },
-  micStem: {
-    width: 4,
-    height: 6,
-    borderRadius: 2,
-    backgroundColor: THEME.colors.text,
-  },
-  micBase: {
-    width: 14,
-    height: 3,
-    borderRadius: 2,
-    backgroundColor: THEME.colors.text,
+  commandButtonDisabled: {
+    opacity: 0.5,
   },
   bottomBar: {
     paddingHorizontal: 16,

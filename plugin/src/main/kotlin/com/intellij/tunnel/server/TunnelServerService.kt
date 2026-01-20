@@ -21,6 +21,10 @@ class TunnelServerService : Disposable {
 
     fun deviceSnapshot(): List<DeviceInfo> = server.deviceRegistry.snapshot()
 
+    fun disconnectDevice(deviceId: String) {
+        server.disconnectDevice(deviceId)
+    }
+
     fun addDeviceListener(listener: DeviceListener, parentDisposable: Disposable) {
         server.deviceRegistry.addListener(listener)
         Disposer.register(parentDisposable) { server.deviceRegistry.removeListener(listener) }

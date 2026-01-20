@@ -113,6 +113,14 @@ class TunnelServer {
         )
     }
 
+    fun disconnectDevice(deviceId: String, reason: String = "Disconnected by IDE") {
+        val session = sessions[deviceId] ?: return
+        logger.info("Disconnecting device id=$deviceId")
+        scope.launch {
+            runCatching { session.close(CloseReason(CloseReason.Codes.NORMAL, reason)) }
+        }
+    }
+
     private fun createServer(port: Int): ApplicationEngine {
         return embeddedServer(Netty, port = port, host = "0.0.0.0") {
             configureServer()
