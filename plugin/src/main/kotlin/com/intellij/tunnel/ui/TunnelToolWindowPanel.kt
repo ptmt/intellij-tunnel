@@ -27,6 +27,7 @@ import javax.swing.DefaultListModel
 import javax.swing.ImageIcon
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.SwingConstants
 import java.awt.datatransfer.StringSelection
 
 class TunnelToolWindowPanel : Disposable {
@@ -38,14 +39,12 @@ class TunnelToolWindowPanel : Disposable {
     private val urlLabel = JBLabel("")
     private val qrLabel = JBLabel()
     private val tokenCopyButton = JButton("Copy Token")
-    private val setupToggleButton = JButton("Show QR")
     private val exposureStatusLabel = JBLabel("")
     private val exposureButton = JButton("Start")
     private val exposureBox = ComboBox(ExposureMode.values())
     private val connectionPanel = JBPanel<JBPanel<*>>()
     private var lastUrl: String? = null
     private var showSetup = true
-    private var autoHideEnabled = true
     val component: JComponent
 
     init {
@@ -54,21 +53,20 @@ class TunnelToolWindowPanel : Disposable {
         header.border = JBUI.Borders.empty(12)
 
         val subtitle = JBLabel("Scan to connect")
+        subtitle.alignmentX = JComponent.CENTER_ALIGNMENT
+        subtitle.horizontalAlignment = SwingConstants.CENTER
         val qrImage = QrCodeRenderer.render(serverService.serverInfo().httpUrl, 220)
         qrLabel.icon = ImageIcon(qrImage)
+        qrLabel.alignmentX = JComponent.CENTER_ALIGNMENT
+        qrLabel.horizontalAlignment = SwingConstants.CENTER
         urlLabel.text = serverService.serverInfo().httpUrl
         urlLabel.border = JBUI.Borders.emptyTop(6)
-        tokenCopyButton.border = JBUI.Borders.emptyTop(4)
+        urlLabel.alignmentX = JComponent.CENTER_ALIGNMENT
+        urlLabel.horizontalAlignment = SwingConstants.CENTER
+        tokenCopyButton.alignmentX = JComponent.CENTER_ALIGNMENT
         tokenCopyButton.addActionListener {
             CopyPasteManager.getInstance().setContents(StringSelection(authService.token()))
             tokenCopyButton.text = "Copied"
-        }
-        setupToggleButton.addActionListener {
-            showSetup = !showSetup
-            if (showSetup) {
-                autoHideEnabled = false
-            }
-            updateSetupVisibility()
         }
 
         exposureBox.renderer = SimpleListCellRenderer.create("") { it.displayName }
@@ -89,26 +87,31 @@ class TunnelToolWindowPanel : Disposable {
         val exposureRow = JBPanel<JBPanel<*>>()
         exposureRow.layout = BoxLayout(exposureRow, BoxLayout.X_AXIS)
         exposureRow.border = JBUI.Borders.emptyTop(8)
+        exposureRow.alignmentX = JComponent.CENTER_ALIGNMENT
+        exposureRow.add(Box.createHorizontalGlue())
         exposureRow.add(JBLabel("Exposure"))
         exposureRow.add(Box.createHorizontalStrut(8))
         exposureRow.add(exposureBox)
         exposureRow.add(Box.createHorizontalStrut(8))
         exposureRow.add(exposureButton)
+        exposureRow.add(Box.createHorizontalGlue())
 
         connectionPanel.layout = BoxLayout(connectionPanel, BoxLayout.Y_AXIS)
+        connectionPanel.alignmentX = JComponent.CENTER_ALIGNMENT
         connectionPanel.add(subtitle)
         connectionPanel.add(qrLabel)
         connectionPanel.add(urlLabel)
+        connectionPanel.add(Box.createVerticalStrut(4))
         connectionPanel.add(tokenCopyButton)
         connectionPanel.add(exposureRow)
+        exposureStatusLabel.alignmentX = JComponent.CENTER_ALIGNMENT
+        exposureStatusLabel.horizontalAlignment = SwingConstants.CENTER
         connectionPanel.add(exposureStatusLabel)
 
         val devicesHeader = JBPanel<JBPanel<*>>()
         devicesHeader.layout = BoxLayout(devicesHeader, BoxLayout.X_AXIS)
         devicesHeader.border = JBUI.Borders.emptyTop(8)
         devicesHeader.add(JBLabel("Connected devices"))
-        devicesHeader.add(Box.createHorizontalGlue())
-        devicesHeader.add(setupToggleButton)
 
         header.add(connectionPanel)
         header.add(devicesHeader)
@@ -140,12 +143,7 @@ class TunnelToolWindowPanel : Disposable {
                     devices.forEach { device ->
                         listModel.addElement("${device.name} - ${device.remoteAddress}")
                     }
-                    if (devices.isEmpty()) {
-                        autoHideEnabled = true
-                        showSetup = true
-                    } else if (autoHideEnabled) {
-                        showSetup = false
-                    }
+                    showSetup = devices.isEmpty()
                     updateSetupVisibility()
                 }
             }
@@ -186,7 +184,6 @@ class TunnelToolWindowPanel : Disposable {
 
     private fun updateSetupVisibility() {
         connectionPanel.isVisible = showSetup
-        setupToggleButton.text = if (showSetup) "Hide QR" else "Show QR"
         connectionPanel.revalidate()
         connectionPanel.repaint()
     }

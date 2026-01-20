@@ -144,6 +144,17 @@ class TunnelServer {
                     ?: call.request.headers["X-Tunnel-Token"]
                 if (!authService.isTokenValid(presentedToken)) {
                     logger.warn("WebSocket rejected: invalid token from ${call.request.origin.remoteHost}")
+                    runCatching {
+                        send(
+                            gson.toJson(
+                                mapOf(
+                                    "type" to "error",
+                                    "code" to "invalid_token",
+                                    "message" to "Invalid pairing token.",
+                                )
+                            )
+                        )
+                    }
                     close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Invalid pairing token"))
                     return@webSocket
                 }
