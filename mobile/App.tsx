@@ -15,6 +15,8 @@ import {
   TextInput,
   View,
 } from "react-native";
+import AudioTranscription from "./AudioTranscription";
+import { THEME } from "./theme";
 
 type ConnectionState = "disconnected" | "connecting" | "connected";
 
@@ -32,7 +34,7 @@ type ConnectionHistoryItem = {
   lastUsed: string;
 };
 
-type AppTab = "terminal" | "builds" | "activity";
+type AppTab = "terminal" | "transcribe" | "builds" | "activity";
 
 type ServerMessage =
   | { type: "hello_ack"; deviceId: string }
@@ -47,24 +49,6 @@ type ServerMessage =
   | { type: "terminal_error"; message: string }
   | { type: "build_status"; status: string; message?: string }
   | { type: "error"; message?: string; code?: string };
-
-const THEME = {
-  colors: {
-    backgroundTop: "#0B1221",
-    backgroundMid: "#12264D",
-    backgroundBottom: "#0B0F1A",
-    card: "rgba(255, 255, 255, 0.08)",
-    cardBorder: "rgba(255, 255, 255, 0.15)",
-    primary: "#F97316",
-    primaryDark: "#C2410C",
-    text: "#F8FAFC",
-    muted: "#CBD5F5",
-    input: "#0F172A",
-    success: "#22C55E",
-    warning: "#F59E0B",
-    danger: "#EF4444",
-  },
-};
 
 const initialServerUrl = "ws://localhost:8765/ws";
 const SESSION_POLL_MS = 6000;
@@ -1198,6 +1182,14 @@ export default function App() {
               </View>
             ) : null}
 
+            {activeTab === "transcribe" ? (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Transcription</Text>
+                <Text style={styles.muted}>On-device Whisper with live microphone input.</Text>
+                <AudioTranscription />
+              </View>
+            ) : null}
+
             {activeTab === "builds" ? (
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Builds</Text>
@@ -1242,6 +1234,25 @@ export default function App() {
                   ]}
                 >
                   Terminal
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[styles.bottomTab, activeTab === "transcribe" && styles.bottomTabActive]}
+                onPress={() => setActiveTab("transcribe")}
+              >
+                <View
+                  style={[
+                    styles.bottomTabIndicator,
+                    activeTab === "transcribe" && styles.bottomTabIndicatorActive,
+                  ]}
+                />
+                <Text
+                  style={[
+                    styles.bottomTabText,
+                    activeTab === "transcribe" && styles.bottomTabTextActive,
+                  ]}
+                >
+                  Transcribe
                 </Text>
               </Pressable>
               <Pressable
