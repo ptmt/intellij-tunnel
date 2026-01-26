@@ -60,12 +60,13 @@ class TunnelToolWindowPanel : Disposable {
     private val exposureStatusLabel = JBLabel("")
     private val exposureButton = JButton("Start")
     private val exposureBox = ComboBox(ExposureMode.values())
+    private val pairDeviceButton = JButton("Pair another device")
     private val connectionPanel = JBPanel<JBPanel<*>>()
     private val deviceMenuHotspot = JBUI.scale(28)
     private val deviceUptimeTimer = Timer(1000) { deviceList.repaint() }
     private val clientIcon = AppleIcon(JBUI.scale(16))
     private var lastUrl: String? = null
-    private var showSetup = true
+    private var pairingPanelVisible = false
     val component: JComponent
 
     init {
@@ -133,6 +134,11 @@ class TunnelToolWindowPanel : Disposable {
         devicesHeader.layout = BoxLayout(devicesHeader, BoxLayout.X_AXIS)
         devicesHeader.border = JBUI.Borders.emptyTop(8)
         devicesHeader.add(JBLabel("Connected devices"))
+        devicesHeader.add(Box.createHorizontalGlue())
+        pairDeviceButton.icon = AllIcons.General.Add
+        pairDeviceButton.isFocusable = false
+        pairDeviceButton.addActionListener { togglePairingPanel() }
+        devicesHeader.add(pairDeviceButton)
 
         header.add(connectionPanel)
         header.add(devicesHeader)
@@ -181,8 +187,10 @@ class TunnelToolWindowPanel : Disposable {
                     devices.forEach { device ->
                         listModel.addElement(device)
                     }
-                    showSetup = devices.isEmpty()
-                    updateSetupVisibility()
+                    if (devices.isEmpty()) {
+                        pairingPanelVisible = false
+                    }
+                    updateSetupVisibility(devices.isNotEmpty())
                 }
             }
         }, this)
@@ -222,9 +230,31 @@ class TunnelToolWindowPanel : Disposable {
     }
 
     private fun updateSetupVisibility() {
+        updateSetupVisibility(listModel.size > 0)
+    }
+
+    private fun updateSetupVisibility(hasDevices: Boolean) {
+        val showSetup = !hasDevices || pairingPanelVisible
         connectionPanel.isVisible = showSetup
         connectionPanel.revalidate()
         connectionPanel.repaint()
+        pairDeviceButton.isVisible = hasDevices
+        if (hasDevices) {
+            if (pairingPanelVisible) {
+                pairDeviceButton.icon = AllIcons.General.Remove
+                pairDeviceButton.text = "Hide pairing"
+                pairDeviceButton.toolTipText = "Hide pairing info"
+            } else {
+                pairDeviceButton.icon = AllIcons.General.Add
+                pairDeviceButton.text = "Pair another device"
+                pairDeviceButton.toolTipText = "Show pairing info"
+            }
+        }
+    }
+
+    private fun togglePairingPanel() {
+        pairingPanelVisible = !pairingPanelVisible
+        updateSetupVisibility()
     }
 
     private fun maybeShowDeviceMenu(event: MouseEvent, allowLeftClick: Boolean = false) {
@@ -242,6 +272,13 @@ class TunnelToolWindowPanel : Disposable {
 
     private fun showDeviceMenu(device: DeviceInfo, x: Int, y: Int) {
         val menu = JPopupMenu()
+        val pairItem = JMenuItem("Pair another device")
+        pairItem.addActionListener {
+            pairingPanelVisible = true
+            updateSetupVisibility()
+        }
+        menu.add(pairItem)
+        menu.addSeparator()
         val disconnectItem = JMenuItem("Disconnect")
         disconnectItem.addActionListener { serverService.disconnectDevice(device.id) }
         menu.add(disconnectItem)

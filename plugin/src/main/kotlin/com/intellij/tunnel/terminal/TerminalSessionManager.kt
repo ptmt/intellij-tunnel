@@ -10,9 +10,12 @@ import com.intellij.openapi.util.registry.Registry
 import com.intellij.terminal.JBTerminalWidget
 import com.intellij.terminal.ui.TerminalWidget
 import com.intellij.tunnel.settings.TunnelTerminalSettingsService
+import com.jediterm.terminal.TerminalStarter
+import com.jediterm.terminal.model.TerminalTextBuffer
 import org.jetbrains.plugins.terminal.LocalBlockTerminalRunner
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
+import java.awt.event.KeyEvent
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
@@ -43,6 +46,11 @@ class TerminalSessionManager {
     private inner class IdeaTerminalBackend(val widget: ShellTerminalWidget) : SessionBackend {
         override fun sendInput(data: String) {
             ApplicationManager.getApplication().invokeLater {
+                val starter = widget.terminalStarter
+                if (starter != null) {
+                    sendInputWithStarter(starter, data)
+                    return@invokeLater
+                }
                 widget.executeWithTtyConnector { connector ->
                     try {
                         connector.write(data)
@@ -54,7 +62,7 @@ class TerminalSessionManager {
         }
 
         override fun snapshot(): String {
-            return runOnEdt { widget.text }
+            return runOnEdt { snapshotTerminalText(widget.terminalPanel.terminalTextBuffer) }
         }
 
         override fun close() {
@@ -74,6 +82,11 @@ class TerminalSessionManager {
     ) : SessionBackend {
         override fun sendInput(data: String) {
             ApplicationManager.getApplication().invokeLater {
+                val starter = jediWidget?.terminalStarter
+                if (starter != null) {
+                    sendInputWithStarter(starter, data)
+                    return@invokeLater
+                }
                 widget.ttyConnectorAccessor.executeWithTtyConnector { connector ->
                     try {
                         connector.write(data)
@@ -87,7 +100,7 @@ class TerminalSessionManager {
         override fun snapshot(): String {
             val widget = jediWidget
             if (widget != null) {
-                return runOnEdt { widget.text }
+                return runOnEdt { snapshotTerminalText(widget.terminalPanel.terminalTextBuffer) }
             }
             return "Terminal output unavailable for the new terminal UI. Disable 'terminal.new.ui' and retry."
         }
@@ -394,6 +407,72 @@ class TerminalSessionManager {
         val lines = text.split('\n')
         if (lines.size <= maxLines) return text
         return lines.takeLast(maxLines).joinToString("\n")
+    }
+
+    private fun snapshotTerminalText(buffer: TerminalTextBuffer): String {
+        buffer.lock()
+        try {
+            val historyLines = buffer.historyLinesCount
+            val screenLines = buffer.screenLinesCount
+            val width = buffer.width
+            if (historyLines == 0 && screenLines == 0) return ""
+            if (width <= 0) return ""
+            val builder = StringBuilder()
+            val lastLineIndex = screenLines - 1
+            for (lineIndex in -historyLines until screenLines) {
+                val line = buffer.getLine(lineIndex)
+                val lineText = buildLineText(line, width)
+                builder.append(lineText)
+                if (!line.isWrapped && lineIndex < lastLineIndex) {
+                    builder.append('\n')
+                }
+            }
+            return builder.toString()
+        } finally {
+            buffer.unlock()
+        }
+    }
+
+    private fun sendInputWithStarter(starter: TerminalStarter, data: String) {
+        if (data.isEmpty()) return
+        val enterCode = starter.getCode(KeyEvent.VK_ENTER, 0)
+        val buffer = StringBuilder()
+        var index = 0
+        while (index < data.length) {
+            val ch = data[index]
+            if (ch == '\r' || ch == '\n') {
+                if (buffer.isNotEmpty()) {
+                    starter.sendString(buffer.toString(), true)
+                    buffer.setLength(0)
+                }
+                if (enterCode != null && enterCode.isNotEmpty()) {
+                    starter.sendBytes(enterCode, true)
+                } else {
+                    starter.sendString("\r", true)
+                }
+                if (ch == '\r' && index + 1 < data.length && data[index + 1] == '\n') {
+                    index++
+                }
+            } else {
+                buffer.append(ch)
+            }
+            index++
+        }
+        if (buffer.isNotEmpty()) {
+            starter.sendString(buffer.toString(), true)
+        }
+    }
+
+    private fun buildLineText(line: com.jediterm.terminal.model.TerminalLine, width: Int): String {
+        val chars = CharArray(width)
+        for (column in 0 until width) {
+            chars[column] = line.charAt(column)
+        }
+        var end = width
+        while (end > 0 && chars[end - 1] == ' ') {
+            end--
+        }
+        return if (end == width) String(chars) else String(chars, 0, end)
     }
 
     private fun <T> runOnEdt(action: () -> T): T {

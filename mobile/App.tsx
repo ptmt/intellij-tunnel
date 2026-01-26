@@ -183,7 +183,8 @@ export default function App() {
   const buildHistoryId = (url: string) => normalizeUrl(url).trim();
   const shouldForceConnectionModal =
     settingsReady && connectionHistory.length === 0 && connection !== "connected";
-  const connectionModalOpen = connectionModalVisible || shouldForceConnectionModal;
+  const connectionModalOpen =
+    (connectionModalVisible || shouldForceConnectionModal) && !scannerVisible;
   const formatLastUsed = (value: string) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime()) || date.getTime() <= 0) {
@@ -1253,7 +1254,7 @@ export default function App() {
     if (!activeSessionId) return;
     const data = command;
     if (!data.trim()) return;
-    const payload = appendNewline ? `${data}\n` : data;
+    const payload = appendNewline ? `${data}\r` : data;
     send({ type: "terminal_input", sessionId: activeSessionId, data: payload });
     setCommand("");
     requestSnapshot(activeSessionId);
@@ -1451,7 +1452,7 @@ export default function App() {
           style={styles.modalContainer}
         >
           <SafeAreaView style={styles.modalSafeArea}>
-            <ScrollView contentContainerStyle={styles.modalContent}>
+            <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
               <View style={styles.card}>
                 <View style={styles.modalHeader}>
                   <Text style={styles.cardTitle}>New connection</Text>
@@ -1464,9 +1465,23 @@ export default function App() {
                     </Pressable>
                   ) : null}
                 </View>
-                {shouldForceConnectionModal ? (
-                  <Text style={styles.modalHint}>Add a connection to get started.</Text>
-                ) : null}
+                <Text style={[styles.modalHint, styles.modalSubHint]}>
+                  Make sure you launched the InTunnel plugin in IntelliJ and opened it.
+                </Text>
+                <Pressable
+                  style={[styles.button, styles.buttonPrimary, styles.qrPrimaryButton]}
+                  onPress={openScanner}
+                  accessibilityLabel="Scan QR code"
+                >
+                  <View style={styles.qrIcon}>
+                    <View style={[styles.qrIconFinder, styles.qrIconFinderTopLeft]} />
+                    <View style={[styles.qrIconFinder, styles.qrIconFinderTopRight]} />
+                    <View style={[styles.qrIconFinder, styles.qrIconFinderBottomLeft]} />
+                    <View style={styles.qrIconDot} />
+                  </View>
+                  <Text style={styles.qrPrimaryButtonText}>Scan QR code</Text>
+                </Pressable>
+                <Text style={[styles.modalHint, styles.manualEntryHint]}>Manual entry (fallback)</Text>
                 <View style={styles.urlRow}>
                   <TextInput
                     style={[styles.input, styles.urlInput]}
@@ -1477,13 +1492,6 @@ export default function App() {
                     placeholder="ws://host:8765/ws"
                     placeholderTextColor="rgba(248, 250, 252, 0.4)"
                   />
-                  <Pressable
-                    style={styles.qrButton}
-                    onPress={openScanner}
-                    accessibilityLabel="Scan QR code"
-                  >
-                    <Text style={styles.qrButtonText}>QR</Text>
-                  </Pressable>
                 </View>
                 <TextInput
                   style={styles.input}
@@ -1686,7 +1694,14 @@ export default function App() {
                       onLayout={handleOutputLayout}
                       scrollEventThrottle={16}
                     >
-                      <Text style={styles.outputText}>{displayOutput || "No output yet."}</Text>
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator
+                        nestedScrollEnabled
+                        contentContainerStyle={styles.outputHorizontalContent}
+                      >
+                        <Text style={styles.outputText}>{displayOutput || "No output yet."}</Text>
+                      </ScrollView>
                     </ScrollView>
                     <View style={styles.commandBlock}>
                       <View style={styles.commandRow}>
@@ -2153,6 +2168,9 @@ const styles = StyleSheet.create({
     color: THEME.colors.muted,
     fontSize: 13,
   },
+  modalSubHint: {
+    marginTop: 6,
+  },
   cardTitle: {
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 18,
@@ -2174,21 +2192,53 @@ const styles = StyleSheet.create({
   urlInput: {
     flex: 1,
   },
-  qrButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: THEME.colors.cardBorder,
-    backgroundColor: "rgba(15, 23, 42, 0.65)",
+  qrPrimaryButton: {
+    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
+    gap: 10,
   },
-  qrButtonText: {
+  qrPrimaryButtonText: {
     fontFamily: "SpaceGrotesk_700Bold",
     color: THEME.colors.text,
-    fontSize: 11,
-    letterSpacing: 1,
+    fontSize: 15,
+  },
+  qrIcon: {
+    width: 18,
+    height: 18,
+    position: "relative",
+  },
+  qrIconFinder: {
+    width: 8,
+    height: 8,
+    borderWidth: 2,
+    borderColor: THEME.colors.text,
+    borderRadius: 2,
+    position: "absolute",
+  },
+  qrIconFinderTopLeft: {
+    top: 0,
+    left: 0,
+  },
+  qrIconFinderTopRight: {
+    top: 0,
+    right: 0,
+  },
+  qrIconFinderBottomLeft: {
+    bottom: 0,
+    left: 0,
+  },
+  qrIconDot: {
+    width: 4,
+    height: 4,
+    backgroundColor: THEME.colors.text,
+    borderRadius: 1,
+    position: "absolute",
+    right: 2,
+    bottom: 2,
+  },
+  manualEntryHint: {
+    marginTop: 8,
   },
   scannerHeader: {
     flexDirection: "row",
@@ -2382,9 +2432,15 @@ const styles = StyleSheet.create({
   },
   outputScroll: {
     maxHeight: 240,
+    backgroundColor: "#000",
+    borderRadius: 12,
   },
   outputScrollContent: {
-    padding: 0,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  outputHorizontalContent: {
+    alignItems: "flex-start",
   },
   outputText: {
     fontFamily: Platform.select({
@@ -2393,7 +2449,7 @@ const styles = StyleSheet.create({
       default: "monospace",
     }),
     color: THEME.colors.text,
-    fontSize: 12,
+    fontSize: 11,
     lineHeight: 18,
   },
   commandBlock: {
