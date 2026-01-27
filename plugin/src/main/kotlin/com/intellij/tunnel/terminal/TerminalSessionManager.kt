@@ -10,8 +10,15 @@ import com.intellij.openapi.util.registry.Registry
 import com.intellij.terminal.JBTerminalWidget
 import com.intellij.terminal.ui.TerminalWidget
 import com.intellij.tunnel.settings.TunnelTerminalSettingsService
-import com.jediterm.terminal.TerminalStarter
+import com.jediterm.core.Color
+import com.jediterm.terminal.Terminal
+import com.jediterm.terminal.TerminalColor
+import com.jediterm.terminal.TerminalOutputStream
+import com.jediterm.terminal.TextStyle
+import com.jediterm.terminal.emulator.ColorPalette
+import com.jediterm.terminal.emulator.ColorPaletteImpl
 import com.jediterm.terminal.model.TerminalTextBuffer
+import com.jediterm.terminal.util.CharUtils
 import org.jetbrains.plugins.terminal.LocalBlockTerminalRunner
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
@@ -36,9 +43,25 @@ class TerminalSessionManager {
         internal val backend: SessionBackend,
     )
 
+    data class TerminalSnapshot internal constructor(
+        val output: String,
+        val cursorOffset: Int,
+        val styles: List<TerminalStyleRun> = emptyList(),
+    )
+
+    data class TerminalStyleRun internal constructor(
+        val start: Int,
+        val end: Int,
+        val fg: String?,
+        val bg: String?,
+        val bold: Boolean,
+        val italic: Boolean,
+        val underline: Boolean,
+    )
+
     internal sealed interface SessionBackend {
         fun sendInput(data: String)
-        fun snapshot(): String
+        fun snapshot(): TerminalSnapshot
         fun close()
         fun isDisposed(): Boolean
     }
@@ -46,9 +69,9 @@ class TerminalSessionManager {
     private inner class IdeaTerminalBackend(val widget: ShellTerminalWidget) : SessionBackend {
         override fun sendInput(data: String) {
             ApplicationManager.getApplication().invokeLater {
-                val starter = widget.terminalStarter
-                if (starter != null) {
-                    sendInputWithStarter(starter, data)
+                val outputStream = widget.terminalPanel.terminalOutputStream
+                if (outputStream != null) {
+                    sendInputWithTerminalOutput(outputStream, widget.terminal, data)
                     return@invokeLater
                 }
                 widget.executeWithTtyConnector { connector ->
@@ -61,8 +84,13 @@ class TerminalSessionManager {
             }
         }
 
-        override fun snapshot(): String {
-            return runOnEdt { snapshotTerminalText(widget.terminalPanel.terminalTextBuffer) }
+        override fun snapshot(): TerminalSnapshot {
+            return runOnEdt {
+                snapshotTerminalText(
+                    widget.terminalPanel.terminalTextBuffer,
+                    widget.terminal,
+                )
+            }
         }
 
         override fun close() {
@@ -82,9 +110,9 @@ class TerminalSessionManager {
     ) : SessionBackend {
         override fun sendInput(data: String) {
             ApplicationManager.getApplication().invokeLater {
-                val starter = jediWidget?.terminalStarter
-                if (starter != null) {
-                    sendInputWithStarter(starter, data)
+                val outputStream = jediWidget?.terminalPanel?.terminalOutputStream
+                if (outputStream != null && jediWidget != null) {
+                    sendInputWithTerminalOutput(outputStream, jediWidget.terminal, data)
                     return@invokeLater
                 }
                 widget.ttyConnectorAccessor.executeWithTtyConnector { connector ->
@@ -97,12 +125,20 @@ class TerminalSessionManager {
             }
         }
 
-        override fun snapshot(): String {
+        override fun snapshot(): TerminalSnapshot {
             val widget = jediWidget
             if (widget != null) {
-                return runOnEdt { snapshotTerminalText(widget.terminalPanel.terminalTextBuffer) }
+                return runOnEdt {
+                    snapshotTerminalText(
+                        widget.terminalPanel.terminalTextBuffer,
+                        widget.terminal,
+                    )
+                }
             }
-            return "Terminal output unavailable for the new terminal UI. Disable 'terminal.new.ui' and retry."
+            return TerminalSnapshot(
+                "Terminal output unavailable for the new terminal UI. Disable 'terminal.new.ui' and retry.",
+                0,
+            )
         }
 
         override fun close() {
@@ -129,9 +165,10 @@ class TerminalSessionManager {
             }
         }
 
-        override fun snapshot(): String {
+        override fun snapshot(): TerminalSnapshot {
             synchronized(lock) {
-                return output.toString()
+                val text = output.toString()
+                return TerminalSnapshot(text, text.length)
             }
         }
 
@@ -215,7 +252,7 @@ class TerminalSessionManager {
         return true
     }
 
-    fun snapshot(sessionId: String, maxLines: Int): String? {
+    fun snapshot(sessionId: String, maxLines: Int): TerminalSnapshot? {
         val session = sessions[sessionId] ?: run {
             logger.info("snapshot: session missing id=$sessionId")
             return null
@@ -226,8 +263,8 @@ class TerminalSessionManager {
             return null
         }
 
-        val output = session.backend.snapshot()
-        return trimOutput(output, maxLines)
+        val snapshot = session.backend.snapshot()
+        return trimSnapshot(snapshot, maxLines)
     }
 
     fun closeSession(sessionId: String): Boolean {
@@ -402,53 +439,93 @@ class TerminalSessionManager {
         return Disposer.isDisposed(disposable)
     }
 
-    private fun trimOutput(text: String, maxLines: Int): String {
-        if (maxLines <= 0) return text
-        val lines = text.split('\n')
-        if (lines.size <= maxLines) return text
-        return lines.takeLast(maxLines).joinToString("\n")
+    private fun trimSnapshot(snapshot: TerminalSnapshot, maxLines: Int): TerminalSnapshot {
+        if (maxLines <= 0) return snapshot
+        val lines = snapshot.output.split('\n')
+        if (lines.size <= maxLines) return snapshot
+        val removeCount = lines.size - maxLines
+        val removedLength = lines.take(removeCount).sumOf { it.length } + removeCount
+        val trimmedOutput = if (removedLength >= snapshot.output.length) {
+            ""
+        } else {
+            snapshot.output.substring(removedLength)
+        }
+        val adjustedOffset = (snapshot.cursorOffset - removedLength)
+            .coerceAtLeast(0)
+            .coerceAtMost(trimmedOutput.length)
+        val trimmedStyles = trimStyleRuns(snapshot.styles, removedLength, trimmedOutput.length)
+        return TerminalSnapshot(trimmedOutput, adjustedOffset, trimmedStyles)
     }
 
-    private fun snapshotTerminalText(buffer: TerminalTextBuffer): String {
+    private fun snapshotTerminalText(buffer: TerminalTextBuffer, terminal: Terminal): TerminalSnapshot {
         buffer.lock()
         try {
             val historyLines = buffer.historyLinesCount
             val screenLines = buffer.screenLinesCount
             val width = buffer.width
-            if (historyLines == 0 && screenLines == 0) return ""
-            if (width <= 0) return ""
+            if (historyLines == 0 && screenLines == 0) return TerminalSnapshot("", 0)
+            if (screenLines <= 0) return TerminalSnapshot("", 0)
+            if (width <= 0) return TerminalSnapshot("", 0)
+            val cursorLine = (terminal.cursorY - 1).coerceIn(0, screenLines - 1)
+            val cursorColumn = (terminal.cursorX - 1).coerceIn(0, width)
+            val palette = ColorPaletteImpl.XTERM_PALETTE
+            val defaults = resolveDefaultColors(terminal, palette)
+            val styleCache = mutableMapOf<TextStyle, StyleDescriptor>()
             val builder = StringBuilder()
+            var cursorOffset = 0
+            val styleRuns = mutableListOf<TerminalStyleRun>()
             val lastLineIndex = screenLines - 1
             for (lineIndex in -historyLines until screenLines) {
                 val line = buffer.getLine(lineIndex)
-                val lineText = buildLineText(line, width)
-                builder.append(lineText)
+                val lineStart = builder.length
+                val lineSnapshot = buildLineSnapshot(
+                    line = line,
+                    width = width,
+                    cursorColumn = if (lineIndex == cursorLine) cursorColumn else null,
+                    styleResolver = { style -> resolveStyleDescriptor(style, defaults, palette, styleCache) },
+                )
+                builder.append(lineSnapshot.text)
+                lineSnapshot.cursorOffset?.let { offset ->
+                    if (lineIndex == cursorLine) {
+                        cursorOffset = lineStart + offset.coerceAtMost(lineSnapshot.text.length)
+                    }
+                }
+                if (lineSnapshot.runs.isNotEmpty()) {
+                    lineSnapshot.runs.forEach { run ->
+                        styleRuns.add(
+                            run.copy(
+                                start = run.start + lineStart,
+                                end = run.end + lineStart,
+                            )
+                        )
+                    }
+                }
                 if (!line.isWrapped && lineIndex < lastLineIndex) {
                     builder.append('\n')
                 }
             }
-            return builder.toString()
+            return TerminalSnapshot(builder.toString(), cursorOffset, styleRuns)
         } finally {
             buffer.unlock()
         }
     }
 
-    private fun sendInputWithStarter(starter: TerminalStarter, data: String) {
+    private fun sendInputWithTerminalOutput(output: TerminalOutputStream, terminal: Terminal, data: String) {
         if (data.isEmpty()) return
-        val enterCode = starter.getCode(KeyEvent.VK_ENTER, 0)
+        val enterCode = terminal.getCodeForKey(KeyEvent.VK_ENTER, 0)
         val buffer = StringBuilder()
         var index = 0
         while (index < data.length) {
             val ch = data[index]
             if (ch == '\r' || ch == '\n') {
                 if (buffer.isNotEmpty()) {
-                    starter.sendString(buffer.toString(), true)
+                    output.sendString(buffer.toString(), true)
                     buffer.setLength(0)
                 }
                 if (enterCode != null && enterCode.isNotEmpty()) {
-                    starter.sendBytes(enterCode, true)
+                    output.sendBytes(enterCode, true)
                 } else {
-                    starter.sendString("\r", true)
+                    output.sendString("\r", true)
                 }
                 if (ch == '\r' && index + 1 < data.length && data[index + 1] == '\n') {
                     index++
@@ -459,20 +536,197 @@ class TerminalSessionManager {
             index++
         }
         if (buffer.isNotEmpty()) {
-            starter.sendString(buffer.toString(), true)
+            output.sendString(buffer.toString(), true)
         }
     }
 
-    private fun buildLineText(line: com.jediterm.terminal.model.TerminalLine, width: Int): String {
-        val chars = CharArray(width)
+    private data class LineSnapshot(
+        val text: String,
+        val runs: List<TerminalStyleRun>,
+        val cursorOffset: Int?,
+    )
+
+    private data class DefaultColors(val foreground: Color, val background: Color)
+
+    private data class StyleDescriptor(
+        val fg: String?,
+        val bg: String?,
+        val bold: Boolean,
+        val italic: Boolean,
+        val underline: Boolean,
+    )
+
+    private fun buildLineSnapshot(
+        line: com.jediterm.terminal.model.TerminalLine,
+        width: Int,
+        cursorColumn: Int?,
+        styleResolver: (TextStyle?) -> StyleDescriptor,
+    ): LineSnapshot {
+        if (width <= 0) return LineSnapshot("", emptyList(), cursorColumn?.coerceAtLeast(0) ?: 0)
+        var lastNonSpace = -1
         for (column in 0 until width) {
-            chars[column] = line.charAt(column)
+            val ch = line.charAt(column)
+            val isDwc = ch == CharUtils.DWC
+            val displayChar = if (isDwc) CharUtils.EMPTY_CHAR else ch
+            if (isDwc || displayChar != CharUtils.EMPTY_CHAR) {
+                lastNonSpace = column
+            }
         }
-        var end = width
-        while (end > 0 && chars[end - 1] == ' ') {
-            end--
+        val minColumn = if (cursorColumn != null && cursorColumn > 0) cursorColumn - 1 else -1
+        val contentEndColumn = maxOf(lastNonSpace, minColumn)
+        val maxCursorColumn = cursorColumn?.coerceAtMost(width - 1) ?: -1
+        val scanEndColumn = maxOf(contentEndColumn, maxCursorColumn)
+        val builder = StringBuilder()
+        val runs = mutableListOf<TerminalStyleRun>()
+        var cursorOffset: Int? = null
+        var visibleIndex = 0
+        var currentStyle: StyleDescriptor? = null
+        var runStart = 0
+
+        if (scanEndColumn >= 0) {
+            for (column in 0..scanEndColumn) {
+                if (cursorColumn != null && column == cursorColumn) {
+                    cursorOffset = visibleIndex
+                }
+                if (column > contentEndColumn) {
+                    continue
+                }
+                val ch = line.charAt(column)
+                val displayChar = if (ch == CharUtils.DWC) CharUtils.EMPTY_CHAR else ch
+                val style = styleResolver(line.getStyleAt(column))
+                if (currentStyle == null || currentStyle != style) {
+                    if (currentStyle != null && runStart < visibleIndex) {
+                        runs.add(
+                            TerminalStyleRun(
+                                start = runStart,
+                                end = visibleIndex,
+                                fg = currentStyle.fg,
+                                bg = currentStyle.bg,
+                                bold = currentStyle.bold,
+                                italic = currentStyle.italic,
+                                underline = currentStyle.underline,
+                            )
+                        )
+                    }
+                    currentStyle = style
+                    runStart = visibleIndex
+                }
+                builder.append(displayChar)
+                visibleIndex++
+            }
         }
-        return if (end == width) String(chars) else String(chars, 0, end)
+
+        if (cursorColumn != null && cursorColumn >= width) {
+            cursorOffset = visibleIndex
+        }
+
+        if (currentStyle != null && runStart < visibleIndex) {
+            runs.add(
+                TerminalStyleRun(
+                    start = runStart,
+                    end = visibleIndex,
+                    fg = currentStyle.fg,
+                    bg = currentStyle.bg,
+                    bold = currentStyle.bold,
+                    italic = currentStyle.italic,
+                    underline = currentStyle.underline,
+                )
+            )
+        }
+
+        return LineSnapshot(builder.toString(), runs, cursorOffset ?: visibleIndex)
+    }
+
+    private fun resolveDefaultColors(terminal: Terminal, palette: ColorPalette): DefaultColors {
+        val windowForeground = terminal.windowForeground
+        val windowBackground = terminal.windowBackground
+        val styleState = terminal.styleState
+        val foreground = windowForeground
+            ?: resolveTerminalColor(styleState.defaultForeground, palette, isForeground = true)
+        val background = windowBackground
+            ?: resolveTerminalColor(styleState.defaultBackground, palette, isForeground = false)
+        return DefaultColors(foreground, background)
+    }
+
+    private fun resolveStyleDescriptor(
+        style: TextStyle?,
+        defaults: DefaultColors,
+        palette: ColorPalette,
+        cache: MutableMap<TextStyle, StyleDescriptor>,
+    ): StyleDescriptor {
+        val resolvedStyle = style ?: TextStyle.EMPTY
+        return cache.getOrPut(resolvedStyle) {
+            val hasInverse = resolvedStyle.hasOption(TextStyle.Option.INVERSE)
+            val hasDim = resolvedStyle.hasOption(TextStyle.Option.DIM)
+            val foregroundColor = resolvedStyle.foreground?.let { resolveTerminalColor(it, palette, true) }
+                ?: defaults.foreground
+            val backgroundColor = resolvedStyle.background?.let { resolveTerminalColor(it, palette, false) }
+                ?: defaults.background
+            var effectiveForeground = if (hasInverse) backgroundColor else foregroundColor
+            val effectiveBackground = if (hasInverse) foregroundColor else backgroundColor
+            if (hasDim) {
+                effectiveForeground = blendColors(effectiveForeground, effectiveBackground)
+            }
+            StyleDescriptor(
+                fg = toHex(effectiveForeground),
+                bg = toHex(effectiveBackground),
+                bold = resolvedStyle.hasOption(TextStyle.Option.BOLD),
+                italic = resolvedStyle.hasOption(TextStyle.Option.ITALIC),
+                underline = resolvedStyle.hasOption(TextStyle.Option.UNDERLINED),
+            )
+        }
+    }
+
+    private fun resolveTerminalColor(
+        color: TerminalColor,
+        palette: ColorPalette,
+        isForeground: Boolean,
+    ): Color {
+        if (!color.isIndexed) {
+            return color.toColor()
+        }
+        val index = color.colorIndex
+        if (index in 0..15) {
+            return if (isForeground) palette.getForeground(color) else palette.getBackground(color)
+        }
+        val extended = ColorPalette.getIndexedTerminalColor(index)
+        if (extended != null && !extended.isIndexed) {
+            return extended.toColor()
+        }
+        val fallback = TerminalColor.index(index % 16)
+        return if (isForeground) palette.getForeground(fallback) else palette.getBackground(fallback)
+    }
+
+    private fun blendColors(foreground: Color, background: Color): Color {
+        val red = (foreground.red + background.red) / 2
+        val green = (foreground.green + background.green) / 2
+        val blue = (foreground.blue + background.blue) / 2
+        val alpha = foreground.alpha
+        return Color(red, green, blue, alpha)
+    }
+
+    private fun toHex(color: Color): String {
+        return String.format("#%02x%02x%02x", color.red, color.green, color.blue)
+    }
+
+    private fun trimStyleRuns(
+        runs: List<TerminalStyleRun>,
+        removedLength: Int,
+        newLength: Int,
+    ): List<TerminalStyleRun> {
+        if (runs.isEmpty()) return runs
+        val result = mutableListOf<TerminalStyleRun>()
+        runs.forEach { run ->
+            val start = run.start - removedLength
+            val end = run.end - removedLength
+            if (end <= 0 || start >= newLength) return@forEach
+            val clippedStart = start.coerceAtLeast(0)
+            val clippedEnd = end.coerceAtMost(newLength)
+            if (clippedEnd > clippedStart) {
+                result.add(run.copy(start = clippedStart, end = clippedEnd))
+            }
+        }
+        return result
     }
 
     private fun <T> runOnEdt(action: () -> T): T {

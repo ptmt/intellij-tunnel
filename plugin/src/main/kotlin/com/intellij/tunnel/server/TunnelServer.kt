@@ -82,7 +82,7 @@ class TunnelServer {
     private val terminalManager = TerminalSessionManager()
     private val authService = TunnelAuthService.getInstance()
     private val terminalSubscriptions = ConcurrentHashMap<String, MutableSet<String>>()
-    private val terminalLastOutput = ConcurrentHashMap<String, String>()
+    private val terminalLastOutput = ConcurrentHashMap<String, TerminalSessionManager.TerminalSnapshot>()
     @Volatile
     private var terminalStreamingJob: Job? = null
     private val terminalStreamLines = 200
@@ -700,13 +700,19 @@ class TunnelServer {
                         sendJson(session, mapOf("type" to "terminal_error", "message" to "Missing sessionId."), connectionId)
                         return
                     }
-                    val output = terminalManager.snapshot(sessionId, maxLines)
-                    if (output == null) {
+                    val snapshot = terminalManager.snapshot(sessionId, maxLines)
+                    if (snapshot == null) {
                         sendJson(session, mapOf("type" to "terminal_error", "message" to "Session not found."), connectionId)
                     } else {
                         sendJson(
                             session,
-                            mapOf("type" to "terminal_output", "sessionId" to sessionId, "output" to output),
+                            mapOf(
+                                "type" to "terminal_output",
+                                "sessionId" to sessionId,
+                                "output" to snapshot.output,
+                                "cursorOffset" to snapshot.cursorOffset,
+                                "styles" to snapshot.styles,
+                            ),
                             connectionId,
                         )
                     }
@@ -832,8 +838,8 @@ class TunnelServer {
         session: DefaultWebSocketSession,
         sessionId: String,
     ) {
-        val output = terminalManager.snapshot(sessionId, terminalStreamLines)
-        if (output == null) {
+        val snapshot = terminalManager.snapshot(sessionId, terminalStreamLines)
+        if (snapshot == null) {
             sendJson(session, mapOf("type" to "terminal_error", "message" to "Session not found."), connectionId)
             return
         }
@@ -841,10 +847,16 @@ class TunnelServer {
             ConcurrentHashMap.newKeySet()
         }
         subscriptions.add(sessionId)
-        terminalLastOutput[sessionId] = output
+        terminalLastOutput[sessionId] = snapshot
         sendJson(
             session,
-            mapOf("type" to "terminal_output", "sessionId" to sessionId, "output" to output),
+            mapOf(
+                "type" to "terminal_output",
+                "sessionId" to sessionId,
+                "output" to snapshot.output,
+                "cursorOffset" to snapshot.cursorOffset,
+                "styles" to snapshot.styles,
+            ),
             connectionId,
         )
     }
@@ -877,15 +889,15 @@ class TunnelServer {
         val sessionIds = terminalSubscriptions.values.flatMap { it.toList() }.toSet()
         if (sessionIds.isEmpty()) return
         sessionIds.forEach { sessionId ->
-            val output = runCatching { terminalManager.snapshot(sessionId, terminalStreamLines) }.getOrNull()
-            if (output == null) {
+            val snapshot = runCatching { terminalManager.snapshot(sessionId, terminalStreamLines) }.getOrNull()
+            if (snapshot == null) {
                 removeSessionFromSubscriptions(sessionId)
                 return@forEach
             }
             val previous = terminalLastOutput[sessionId]
-            if (previous == output) return@forEach
-            terminalLastOutput[sessionId] = output
-            broadcastTerminalOutput(sessionId, output)
+            if (previous == snapshot) return@forEach
+            terminalLastOutput[sessionId] = snapshot
+            broadcastTerminalOutput(sessionId, snapshot)
         }
     }
 
@@ -899,7 +911,7 @@ class TunnelServer {
         terminalLastOutput.remove(sessionId)
     }
 
-    private fun broadcastTerminalOutput(sessionId: String, output: String) {
+    private fun broadcastTerminalOutput(sessionId: String, snapshot: TerminalSessionManager.TerminalSnapshot) {
         terminalSubscriptions.forEach { (connectionId, subscriptions) ->
             if (!subscriptions.contains(sessionId)) return@forEach
             val context = connectionContexts[connectionId]
@@ -907,7 +919,13 @@ class TunnelServer {
             val wsSession = sessions[connectionId] ?: return@forEach
             sendJson(
                 wsSession,
-                mapOf("type" to "terminal_output", "sessionId" to sessionId, "output" to output),
+                mapOf(
+                    "type" to "terminal_output",
+                    "sessionId" to sessionId,
+                    "output" to snapshot.output,
+                    "cursorOffset" to snapshot.cursorOffset,
+                    "styles" to snapshot.styles,
+                ),
                 connectionId,
             )
         }

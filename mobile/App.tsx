@@ -11,11 +11,13 @@ import {
   LayoutChangeEvent,
   NativeScrollEvent,
   NativeSyntheticEvent,
+  Animated,
   Pressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
+  TextStyle,
   TextInput,
   View,
 } from "react-native";
@@ -29,6 +31,16 @@ type TerminalSession = {
   name: string;
   workingDirectory: string;
   createdAt: string;
+};
+
+type TerminalStyleRun = {
+  start: number;
+  end: number;
+  fg?: string | null;
+  bg?: string | null;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
 };
 
 type RunConfigurationItem = {
@@ -68,7 +80,13 @@ type ServerMessage =
   | { type: "approval_denied"; message?: string }
   | { type: "sessions"; items: TerminalSession[] }
   | { type: "terminal_started"; session: TerminalSession }
-  | { type: "terminal_output"; sessionId: string; output: string }
+  | {
+      type: "terminal_output";
+      sessionId: string;
+      output: string;
+      cursorOffset?: number;
+      styles?: TerminalStyleRun[];
+    }
   | { type: "terminal_closed"; sessionId: string }
   | { type: "terminal_error"; message: string }
   | { type: "ide_progress"; tasks: IdeProgressTask[] }
@@ -135,6 +153,11 @@ export default function App() {
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
+  const [terminalCursorOffsets, setTerminalCursorOffsets] = useState<Record<string, number | null>>({});
+  const [terminalOutputStyles, setTerminalOutputStyles] = useState<
+    Record<string, TerminalStyleRun[] | null>
+  >({});
+  const [quickKeysPinned, setQuickKeysPinned] = useState(false);
   const [command, setCommand] = useState<string>("");
   const [buildStatus, setBuildStatus] = useState<string>("idle");
   const [ideProgress, setIdeProgress] = useState<IdeProgressTask[]>([]);
@@ -160,6 +183,8 @@ export default function App() {
   const connectionRef = useRef<ConnectionState>("disconnected");
   const serverUrlRef = useRef(serverUrl);
   const pairingTokenRef = useRef(pairingToken);
+  const statusPulse = useRef(new Animated.Value(0)).current;
+  const statusPulseAnimationRef = useRef<Animated.CompositeAnimation | null>(null);
   const invalidTokenHandledRef = useRef(false);
   const autoConnectAttemptedRef = useRef(false);
   const clientIdRef = useRef<string | null>(null);
@@ -180,6 +205,32 @@ export default function App() {
     return THEME.colors.danger;
   }, [connection, isConnectingStatus]);
 
+  useEffect(() => {
+    if (isConnectingStatus) {
+      statusPulse.setValue(0);
+      const animation = Animated.loop(
+        Animated.sequence([
+          Animated.timing(statusPulse, {
+            toValue: 1,
+            duration: 900,
+            useNativeDriver: true,
+          }),
+          Animated.timing(statusPulse, {
+            toValue: 0,
+            duration: 900,
+            useNativeDriver: true,
+          }),
+        ]),
+      );
+      statusPulseAnimationRef.current = animation;
+      animation.start();
+    } else {
+      statusPulseAnimationRef.current?.stop();
+      statusPulseAnimationRef.current = null;
+      statusPulse.setValue(0);
+    }
+  }, [isConnectingStatus, statusPulse]);
+
   const buildHistoryId = (url: string) => normalizeUrl(url).trim();
   const shouldForceConnectionModal =
     settingsReady && connectionHistory.length === 0 && connection !== "connected";
@@ -197,6 +248,16 @@ export default function App() {
   const hasCachedSessions = sessions.length > 0;
   const showCachedContent = connection === "disconnected" && hasCachedSessions;
   const isLoading = connection === "connecting" || (canInteract && !sessionsLoaded);
+  const pulsingStatusStyle = isConnectingStatus
+    ? {
+        opacity: statusPulse.interpolate({ inputRange: [0, 1], outputRange: [0.4, 1] }),
+        transform: [
+          {
+            scale: statusPulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.35] }),
+          },
+        ],
+      }
+    : null;
 
   const transcriptionText = useMemo(() => {
     if (transcription.committedText && transcription.partialText) {
@@ -854,13 +915,235 @@ export default function App() {
     return value.toLowerCase() === "invalid_token";
   };
 
-  const filterTerminalOutput = (value: string) => {
+  const mergeStyleRuns = (runs: TerminalStyleRun[]) => {
+    if (runs.length <= 1) return runs;
+    const sorted = [...runs].sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged: TerminalStyleRun[] = [];
+    sorted.forEach((run) => {
+      const last = merged[merged.length - 1];
+      if (
+        last &&
+        last.end === run.start &&
+        last.fg === run.fg &&
+        last.bg === run.bg &&
+        Boolean(last.bold) === Boolean(run.bold) &&
+        Boolean(last.italic) === Boolean(run.italic) &&
+        Boolean(last.underline) === Boolean(run.underline)
+      ) {
+        last.end = run.end;
+      } else {
+        merged.push({ ...run });
+      }
+    });
+    return merged;
+  };
+
+  const remapStyleRuns = (
+    runs: TerminalStyleRun[] | null | undefined,
+    keptRanges: { start: number; end: number; newStart: number }[],
+    originalLength: number,
+  ) => {
+    if (!runs || runs.length === 0) return runs ?? null;
+    if (keptRanges.length === 0) return [];
+    const remapped: TerminalStyleRun[] = [];
+    runs.forEach((run) => {
+      if (typeof run.start !== "number" || typeof run.end !== "number") return;
+      const clampedStart = Math.max(0, Math.min(run.start, originalLength));
+      const clampedEnd = Math.max(clampedStart, Math.min(run.end, originalLength));
+      if (clampedEnd <= clampedStart) return;
+      keptRanges.forEach((range) => {
+        const start = Math.max(clampedStart, range.start);
+        const end = Math.min(clampedEnd, range.end);
+        if (start >= end) return;
+        const newStart = range.newStart + (start - range.start);
+        const newEnd = newStart + (end - start);
+        remapped.push({
+          ...run,
+          start: newStart,
+          end: newEnd,
+        });
+      });
+    });
+    return mergeStyleRuns(remapped);
+  };
+
+  const filterTerminalOutputWithCursor = (
+    value: string,
+    cursorOffset: number | null,
+    styles?: TerminalStyleRun[] | null,
+  ) => {
     const removeNeedle =
       "Unable to proceed. Could not locate working directory.: No such file or directory (os error 2)";
-    return value
-      .split(/\r?\n/)
-      .filter((line) => !line.includes(removeNeedle))
-      .join("\n");
+    const lines = value.split(/\r?\n/);
+    let offset = cursorOffset;
+    let cursorDropped = false;
+    let index = 0;
+    let nextOutput = "";
+    const keptRanges: { start: number; end: number; newStart: number }[] = [];
+    lines.forEach((line, lineIndex) => {
+      const hasNewline = lineIndex < lines.length - 1;
+      const lineLength = line.length + (hasNewline ? 1 : 0);
+      if (line.includes(removeNeedle)) {
+        if (typeof offset === "number" && !cursorDropped) {
+          if (offset >= index + lineLength) {
+            offset -= lineLength;
+          } else if (offset >= index) {
+            cursorDropped = true;
+            offset = null;
+          }
+        }
+      } else {
+        const start = index;
+        const end = index + lineLength;
+        const newStart = nextOutput.length;
+        keptRanges.push({ start, end, newStart });
+        nextOutput += value.slice(start, end);
+      }
+      index += lineLength;
+    });
+    const nextStyles =
+      styles && keptRanges.length !== lines.length
+        ? remapStyleRuns(styles, keptRanges, value.length)
+        : styles ?? null;
+    return {
+      output: nextOutput,
+      cursorOffset: cursorDropped ? null : offset,
+      styles: nextStyles,
+    };
+  };
+
+  const buildStyledSegments = (value: string, styles?: TerminalStyleRun[] | null) => {
+    if (!styles || styles.length === 0) {
+      return [{ text: value, style: null as TextStyle | null }];
+    }
+    const sorted = [...styles].sort((a, b) => a.start - b.start || a.end - b.end);
+    const segments: { text: string; style: TextStyle | null }[] = [];
+    const styleCache = new Map<string, TextStyle>();
+    let index = 0;
+    const makeStyle = (run: TerminalStyleRun) => {
+      const key = `${run.fg ?? ""}|${run.bg ?? ""}|${run.bold ? 1 : 0}|${run.italic ? 1 : 0}|${
+        run.underline ? 1 : 0
+      }`;
+      const cached = styleCache.get(key);
+      if (cached) return cached;
+      const style: TextStyle = {};
+      if (run.fg) {
+        style.color = run.fg;
+      }
+      if (run.bg) {
+        style.backgroundColor = run.bg;
+      }
+      if (run.bold) {
+        style.fontWeight = "700";
+      }
+      if (run.italic) {
+        style.fontStyle = "italic";
+      }
+      if (run.underline) {
+        style.textDecorationLine = "underline";
+      }
+      styleCache.set(key, style);
+      return style;
+    };
+    sorted.forEach((run) => {
+      const start = Math.max(0, Math.min(run.start, value.length));
+      const end = Math.max(start, Math.min(run.end, value.length));
+      if (start > index) {
+        segments.push({ text: value.slice(index, start), style: null });
+      }
+      if (end > start) {
+        segments.push({ text: value.slice(start, end), style: makeStyle(run) });
+      }
+      index = end;
+    });
+    if (index < value.length) {
+      segments.push({ text: value.slice(index), style: null });
+    }
+    return segments;
+  };
+
+  const buildOutputNodes = (
+    segments: { text: string; style: TextStyle | null }[],
+    cursorOffset: number | null,
+    showCursor: boolean,
+  ) => {
+    if (!showCursor || typeof cursorOffset !== "number" || Number.isNaN(cursorOffset)) {
+      return segments.map((segment, idx) => {
+        if (!segment.text) return null;
+        if (!segment.style) return segment.text;
+        return (
+          <Text key={`seg-${idx}`} style={segment.style}>
+            {segment.text}
+          </Text>
+        );
+      });
+    }
+    const totalLength = segments.reduce((acc, segment) => acc + segment.text.length, 0);
+    const clampedOffset = Math.max(0, Math.min(cursorOffset, totalLength));
+    const nodes: React.ReactNode[] = [];
+    let cursorInserted = false;
+    let index = 0;
+    let keyIndex = 0;
+    segments.forEach((segment) => {
+      if (!segment.text) return;
+      const segmentEnd = index + segment.text.length;
+      if (!cursorInserted && clampedOffset >= index && clampedOffset < segmentEnd) {
+        const splitIndex = Math.max(0, Math.min(clampedOffset - index, segment.text.length - 1));
+        const before = segment.text.slice(0, splitIndex);
+        const cursorChar = segment.text.charAt(splitIndex);
+        const after = segment.text.slice(splitIndex + 1);
+        if (before) {
+          if (segment.style) {
+            nodes.push(
+              <Text key={`seg-${keyIndex++}`} style={segment.style}>
+                {before}
+              </Text>
+            );
+          } else {
+            nodes.push(before);
+          }
+        }
+        nodes.push(
+          <Text
+            key={`cursor-${keyIndex++}`}
+            style={segment.style ? [segment.style, styles.outputCursor] : styles.outputCursor}
+          >
+            {cursorChar || " "}
+          </Text>
+        );
+        cursorInserted = true;
+        if (after) {
+          if (segment.style) {
+            nodes.push(
+              <Text key={`seg-${keyIndex++}`} style={segment.style}>
+                {after}
+              </Text>
+            );
+          } else {
+            nodes.push(after);
+          }
+        }
+      } else {
+        if (segment.style) {
+          nodes.push(
+            <Text key={`seg-${keyIndex++}`} style={segment.style}>
+              {segment.text}
+            </Text>
+          );
+        } else {
+          nodes.push(segment.text);
+        }
+      }
+      index = segmentEnd;
+    });
+    if (!cursorInserted && clampedOffset === index) {
+      nodes.push(
+        <Text key={`cursor-${keyIndex++}`} style={styles.outputCursor}>
+          {" "}
+        </Text>
+      );
+    }
+    return nodes;
   };
 
   const scrollOutputToEnd = (animated: boolean) => {
@@ -1088,9 +1371,27 @@ export default function App() {
           setSessionsLoaded(true);
         } else if (message.type === "terminal_output") {
           setTerminalOutputs((prev) => ({ ...prev, [message.sessionId]: message.output }));
+          setTerminalCursorOffsets((prev) => ({
+            ...prev,
+            [message.sessionId]: typeof message.cursorOffset === "number" ? message.cursorOffset : null,
+          }));
+          setTerminalOutputStyles((prev) => ({
+            ...prev,
+            [message.sessionId]: Array.isArray(message.styles) ? message.styles : null,
+          }));
         } else if (message.type === "terminal_closed") {
           setSessions((prev) => prev.filter((session) => session.id !== message.sessionId));
           setTerminalOutputs((prev) => {
+            const next = { ...prev };
+            delete next[message.sessionId];
+            return next;
+          });
+          setTerminalCursorOffsets((prev) => {
+            const next = { ...prev };
+            delete next[message.sessionId];
+            return next;
+          });
+          setTerminalOutputStyles((prev) => {
             const next = { ...prev };
             delete next[message.sessionId];
             return next;
@@ -1259,6 +1560,13 @@ export default function App() {
     setCommand("");
     requestSnapshot(activeSessionId);
   };
+  const sendRawInput = (data: string) => {
+    if (connectionRef.current !== "connected") return;
+    if (!activeSessionId) return;
+    if (!data) return;
+    send({ type: "terminal_input", sessionId: activeSessionId, data });
+    requestSnapshot(activeSessionId);
+  };
   const submitCommand = () => sendCommand(true);
   const triggerBuild = () => {
     if (connectionRef.current !== "connected") return;
@@ -1281,10 +1589,54 @@ export default function App() {
   const displaySessions = canInteract || showCachedContent ? sessions : [];
   const displayActiveSessionId = canInteract || showCachedContent ? activeSessionId : null;
   const activeOutput = displayActiveSessionId ? terminalOutputs[displayActiveSessionId] ?? "" : "";
-  const displayOutput = filterTerminalOutput(activeOutput);
+  const activeCursorOffset =
+    displayActiveSessionId != null ? terminalCursorOffsets[displayActiveSessionId] ?? null : null;
+  const activeStyles =
+    displayActiveSessionId != null ? terminalOutputStyles[displayActiveSessionId] ?? null : null;
+  const { output: filteredOutput, cursorOffset: filteredCursorOffset, styles: filteredStyles } = useMemo(() => {
+    return filterTerminalOutputWithCursor(activeOutput, activeCursorOffset, activeStyles);
+  }, [activeCursorOffset, activeOutput, activeStyles]);
+  const showCursor = canInteract && displayActiveSessionId != null;
+  const hasLiveOutput = filteredOutput.length > 0 || (showCursor && filteredCursorOffset != null);
+  const outputValue = filteredOutput || (showCursor && filteredCursorOffset != null ? "" : "No output yet.");
+  const outputStyles = hasLiveOutput ? filteredStyles : null;
+  const outputSegments = useMemo(() => {
+    return buildStyledSegments(outputValue, outputStyles);
+  }, [outputStyles, outputValue]);
+  const outputNodes = useMemo(() => {
+    return buildOutputNodes(outputSegments, filteredCursorOffset, showCursor);
+  }, [filteredCursorOffset, outputSegments, showCursor]);
   const activeSession = displayActiveSessionId
     ? displaySessions.find((session) => session.id === displayActiveSessionId) ?? null
     : null;
+  const shouldSuggestQuickKeys = useMemo(() => {
+    if (!showCursor) return false;
+    const tail = filteredOutput.slice(-400);
+    if (!tail) return false;
+    const promptRegex =
+      /(press|select|choose|allow|permit|approve|grant|continue|proceed|enter|confirm|authorize|y\/n|\[y\/n\]|\([yY]\/[nN]\)|\b[1-9]\)|\[[1-9]\])/i;
+    return promptRegex.test(tail);
+  }, [filteredOutput, showCursor]);
+  const showQuickKeys = canInteract && activeSession != null && (quickKeysPinned || shouldSuggestQuickKeys);
+  const quickKeyButtons = useMemo(
+    () => [
+      { label: "1", value: "1" },
+      { label: "2", value: "2" },
+      { label: "3", value: "3" },
+      { label: "4", value: "4" },
+      { label: "5", value: "5" },
+      { label: "6", value: "6" },
+      { label: "7", value: "7" },
+      { label: "8", value: "8" },
+      { label: "9", value: "9" },
+      { label: "0", value: "0" },
+      { label: "Tab", value: "\t" },
+      { label: "Shift+Tab", value: "\u001b[Z" },
+      { label: "Esc", value: "\u001b" },
+      { label: "Enter", value: "\r" },
+    ],
+    [],
+  );
   const emptyTerminalMessage = (() => {
     if (isLoading) return "Loading sessions...";
     if (!canInteract && !showCachedContent) {
@@ -1515,7 +1867,9 @@ export default function App() {
                   </Pressable>
                 </View>
                 <View style={styles.statusRow}>
-                  <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
+                  <Animated.View
+                    style={[styles.statusDot, { backgroundColor: statusColor }, pulsingStatusStyle]}
+                  />
                   <Text style={styles.statusText}>{statusLabel}</Text>
                   {deviceId ? <Text style={styles.statusMeta}>ID {deviceId.slice(0, 6)}</Text> : null}
                 </View>
@@ -1643,7 +1997,9 @@ export default function App() {
                 onPress={() => setConnectionModalVisible(true)}
                 style={styles.statusButton}
               >
-                <View style={[styles.statusIndicator, { backgroundColor: statusColor }]} />
+                <Animated.View
+                  style={[styles.statusIndicator, { backgroundColor: statusColor }, pulsingStatusStyle]}
+                />
               </Pressable>
             </View>
 
@@ -1700,7 +2056,9 @@ export default function App() {
                         nestedScrollEnabled
                         contentContainerStyle={styles.outputHorizontalContent}
                       >
-                        <Text style={styles.outputText}>{displayOutput || "No output yet."}</Text>
+                      <Text style={styles.outputText}>
+                        {outputNodes}
+                      </Text>
                       </ScrollView>
                     </ScrollView>
                     <View style={styles.commandBlock}>
@@ -1746,6 +2104,38 @@ export default function App() {
                           <Text style={styles.buttonText}>Send</Text>
                         </Pressable>
                       </View>
+                      {canInteract ? (
+                        <View style={styles.quickKeysToggleRow}>
+                          <Pressable
+                            style={[styles.quickKeysToggle, quickKeysPinned && styles.quickKeysToggleActive]}
+                            onPress={() => setQuickKeysPinned((prev) => !prev)}
+                          >
+                            <Text style={styles.quickKeysToggleText}>
+                              {quickKeysPinned ? "Hide keys" : "Show keys"}
+                            </Text>
+                          </Pressable>
+                          {shouldSuggestQuickKeys && !quickKeysPinned ? (
+                            <Text style={styles.quickKeysHint}>Prompt detected</Text>
+                          ) : null}
+                        </View>
+                      ) : null}
+                      {showQuickKeys ? (
+                        <ScrollView
+                          horizontal
+                          showsHorizontalScrollIndicator={false}
+                          contentContainerStyle={styles.quickKeysRow}
+                        >
+                          {quickKeyButtons.map((key) => (
+                            <Pressable
+                              key={key.label}
+                              style={styles.quickKeyButton}
+                              onPress={() => sendRawInput(key.value)}
+                            >
+                              <Text style={styles.quickKeyText}>{key.label}</Text>
+                            </Pressable>
+                          ))}
+                        </ScrollView>
+                      ) : null}
                       {micStatus ? (
                         <Text style={[styles.muted, micStatusIsError && styles.micStatusError]}>
                           {micStatus}
@@ -2452,6 +2842,10 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 18,
   },
+  outputCursor: {
+    backgroundColor: THEME.colors.primary,
+    color: "#0B0F1A",
+  },
   commandBlock: {
     gap: 6,
   },
@@ -2459,6 +2853,54 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 10,
     alignItems: "center",
+  },
+  quickKeysToggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  quickKeysToggle: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.4)",
+  },
+  quickKeysToggleActive: {
+    borderColor: THEME.colors.primary,
+    backgroundColor: "rgba(249, 115, 22, 0.18)",
+  },
+  quickKeysToggleText: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.text,
+    fontSize: 12,
+  },
+  quickKeysHint: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.warning,
+    fontSize: 12,
+  },
+  quickKeysRow: {
+    gap: 8,
+    paddingVertical: 6,
+  },
+  quickKeyButton: {
+    minWidth: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  quickKeyText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 13,
   },
   commandInput: {
     flex: 1,
