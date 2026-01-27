@@ -22,6 +22,7 @@ import {
   View,
 } from "react-native";
 import useAudioTranscription from "./useAudioTranscription";
+import VoiceAssistant from "./VoiceAssistant";
 import { THEME } from "./theme";
 
 type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -70,7 +71,7 @@ type ConnectionHistoryItem = {
   lastUsed: string;
 };
 
-type AppTab = "terminal" | "builds" | "activity";
+type AppTab = "terminal" | "builds" | "assistant" | "activity";
 
 type ServerMessage =
   | { type: "hello_ack"; deviceId: string }
@@ -2249,6 +2250,13 @@ export default function App() {
               </View>
             ) : null}
 
+            {activeTab === "assistant" ? (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Voice assistant</Text>
+                <VoiceAssistant />
+              </View>
+            ) : null}
+
             {activeTab === "activity" ? (
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Activity</Text>
@@ -2314,6 +2322,25 @@ export default function App() {
                     )
                   ) : null}
                 </View>
+              </Pressable>
+              <Pressable
+                style={[styles.bottomTab, activeTab === "assistant" && styles.bottomTabActive]}
+                onPress={() => setActiveTab("assistant")}
+              >
+                <View
+                  style={[
+                    styles.bottomTabIndicator,
+                    activeTab === "assistant" && styles.bottomTabIndicatorActive,
+                  ]}
+                />
+                <Text
+                  style={[
+                    styles.bottomTabText,
+                    activeTab === "assistant" && styles.bottomTabTextActive,
+                  ]}
+                >
+                  Assistant
+                </Text>
               </Pressable>
               <Pressable
                 style={[styles.bottomTab, activeTab === "activity" && styles.bottomTabActive]}

@@ -34,7 +34,9 @@
             "mediaPlayback"
           ]
         }
-      ]
+      ],
+      "./plugins/withWebRTC",
+      "@livekit/react-native-expo-plugin"
     ],
     "extra": {
       "eas": {
