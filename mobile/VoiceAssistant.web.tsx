@@ -5,10 +5,7 @@ import { THEME } from "./theme";
 export default function VoiceAssistant() {
   return (
     <View style={styles.container}>
-      <Text style={styles.muted}>
-        Voice assistant is available in iOS/Android dev builds. Expo Go and the web build do not
-        include the required WebRTC modules.
-      </Text>
+      <Text style={styles.muted}>Available only in iOS/Android.</Text>
     </View>
   );
 }

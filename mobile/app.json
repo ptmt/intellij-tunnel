@@ -11,6 +11,9 @@
       "android",
       "web"
     ],
+    "web": {
+      "favicon": "./assets/icon.png"
+    },
     "plugins": [
       [
         "expo-camera",

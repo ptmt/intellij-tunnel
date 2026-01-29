@@ -10,11 +10,15 @@ import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.util.SystemInfo
 import com.intellij.openapi.util.Disposer
 import com.intellij.tunnel.server.TunnelServerService
 import com.intellij.util.concurrency.AppExecutorUtil
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
+import java.nio.file.Files
+import java.nio.file.Paths
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.Volatile
@@ -118,6 +122,15 @@ class TunnelExposureService : PersistentStateComponent<TunnelExposureSettingsSta
 
     private fun startCloudflared() {
         if (cloudflaredProcess?.isAlive == true) return
+        if (!isExecutableAvailable("cloudflared")) {
+            val message = if (SystemInfo.isMac) {
+                "cloudflared not found.\nInstall via Homebrew:\nbrew install cloudflared"
+            } else {
+                "cloudflared not found.\nPlease install cloudflared and ensure it is on PATH."
+            }
+            updateState(ExposureState(ExposureMode.CLOUDFLARE, ExposureStatus.ERROR, null, message))
+            return
+        }
         val port = TunnelServerService.getInstance().serverInfo().port
         val command = listOf(
             "cloudflared",
@@ -238,6 +251,21 @@ class TunnelExposureService : PersistentStateComponent<TunnelExposureSettingsSta
         runCommand(listOf("tailscale", "serve", "--off"), 10)
     }
 
+    private fun isExecutableAvailable(command: String): Boolean {
+        val path = System.getenv("PATH") ?: return false
+        val extensions = if (SystemInfo.isWindows) listOf(".exe", ".cmd", ".bat", "") else listOf("")
+        return path.split(File.pathSeparatorChar)
+            .asSequence()
+            .filter { it.isNotBlank() }
+            .any { dir ->
+                val base = Paths.get(dir.trim())
+                extensions.any { ext ->
+                    val candidate = base.resolve("$command$ext")
+                    Files.isRegularFile(candidate) && Files.isExecutable(candidate)
+                }
+            }
+    }
+
     private fun resolveTailscaleUrl(): String? {
         val status = runCommand(listOf("tailscale", "status", "--json"), 5)
         if (!status.success) return null
@@ -249,8 +277,7 @@ class TunnelExposureService : PersistentStateComponent<TunnelExposureSettingsSta
     }
 
     private fun extractCloudflareUrl(line: String): String? {
-        val match = Regex("https://[\\w.-]+\\.trycloudflare\\.com").find(line)
-            ?: Regex("https://\\S+").find(line)
+        val match = Regex("https://[\\w.-]+\\.(trycloudflare\\.com|cfargotunnel\\.com)").find(line)
         return match?.value?.trimEnd('.', ',', ')', ';')
     }
 

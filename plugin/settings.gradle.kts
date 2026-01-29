@@ -1,1 +1,1 @@
-rootProject.name = "intellij-tunnel-plugin"
+rootProject.name = "in-tunnel-plugin"

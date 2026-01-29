@@ -56,6 +56,7 @@ class TunnelToolWindowPanel : Disposable {
     private val deviceList = JBList(listModel)
     private val urlLabel = JBLabel("")
     private val qrLabel = JBLabel()
+    private val urlCopyButton = JButton("Copy URL")
     private val tokenCopyButton = JButton("Copy Token")
     private val exposureStatusLabel = JBLabel("")
     private val exposureButton = JButton("Start")
@@ -85,6 +86,12 @@ class TunnelToolWindowPanel : Disposable {
         urlLabel.border = JBUI.Borders.emptyTop(6)
         urlLabel.alignmentX = JComponent.CENTER_ALIGNMENT
         urlLabel.horizontalAlignment = SwingConstants.CENTER
+        urlCopyButton.alignmentX = JComponent.CENTER_ALIGNMENT
+        urlCopyButton.addActionListener {
+            val url = lastUrl ?: serverService.serverInfo().httpUrl
+            CopyPasteManager.getInstance().setContents(StringSelection(url))
+            urlCopyButton.text = "Copied"
+        }
         tokenCopyButton.alignmentX = JComponent.CENTER_ALIGNMENT
         tokenCopyButton.addActionListener {
             CopyPasteManager.getInstance().setContents(StringSelection(authService.token()))
@@ -124,7 +131,15 @@ class TunnelToolWindowPanel : Disposable {
         connectionPanel.add(qrLabel)
         connectionPanel.add(urlLabel)
         connectionPanel.add(Box.createVerticalStrut(4))
-        connectionPanel.add(tokenCopyButton)
+        val copyRow = JBPanel<JBPanel<*>>()
+        copyRow.layout = BoxLayout(copyRow, BoxLayout.X_AXIS)
+        copyRow.alignmentX = JComponent.CENTER_ALIGNMENT
+        copyRow.add(Box.createHorizontalGlue())
+        copyRow.add(urlCopyButton)
+        copyRow.add(Box.createHorizontalStrut(8))
+        copyRow.add(tokenCopyButton)
+        copyRow.add(Box.createHorizontalGlue())
+        connectionPanel.add(copyRow)
         connectionPanel.add(exposureRow)
         exposureStatusLabel.alignmentX = JComponent.CENTER_ALIGNMENT
         exposureStatusLabel.horizontalAlignment = SwingConstants.CENTER
@@ -207,6 +222,7 @@ class TunnelToolWindowPanel : Disposable {
         if (url != lastUrl) {
             qrLabel.icon = ImageIcon(QrCodeRenderer.render(url, 220))
             urlLabel.text = url
+            urlCopyButton.text = "Copy URL"
             lastUrl = url
         }
         exposureBox.selectedItem = state.mode
@@ -397,8 +413,27 @@ class TunnelToolWindowPanel : Disposable {
         return when (state.status) {
             ExposureStatus.STARTING -> "$label tunnel starting..."
             ExposureStatus.RUNNING -> "$label tunnel running"
-            ExposureStatus.ERROR -> "$label error: ${state.error ?: "unknown"}"
+            ExposureStatus.ERROR -> formatError(label, state.error)
             ExposureStatus.STOPPED -> "$label tunnel stopped"
         }
+    }
+
+    private fun formatError(label: String, error: String?): String {
+        val message = error ?: "unknown"
+        return if (message.contains('\n')) {
+            val escaped = escapeHtml(message).replace("\n", "<br>")
+            "<html><div style='text-align:center;'>$label error:<br>$escaped</div></html>"
+        } else {
+            "$label error: $message"
+        }
+    }
+
+    private fun escapeHtml(value: String): String {
+        return value
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;")
     }
 }

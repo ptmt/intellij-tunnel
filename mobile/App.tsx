@@ -118,6 +118,7 @@ const initialServerUrl = "ws://localhost:8765/ws";
 const SESSION_POLL_MS = 6000;
 const HISTORY_LIMIT = 6;
 const LOG_LIMIT = 200;
+const COMMAND_HISTORY_LIMIT = 50;
 const STORAGE_KEYS = {
   serverUrl: "tunnel_server_url",
   pairingToken: "tunnel_pairing_token",
@@ -125,6 +126,7 @@ const STORAGE_KEYS = {
   activeSession: "tunnel_active_session",
   connectionHistory: "tunnel_connection_history",
   terminalOutputs: "tunnel_terminal_outputs",
+  commandHistory: "tunnel_command_history",
 };
 
 const formatPercent = (value: number | null | undefined) => {
@@ -145,6 +147,10 @@ export default function App() {
   const [connectionModalVisible, setConnectionModalVisible] = useState(false);
   const [scannerVisible, setScannerVisible] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [commandHistory, setCommandHistory] = useState<string[]>([]);
+  const [commandHistoryVisible, setCommandHistoryVisible] = useState(false);
+  const [terminalMenuVisible, setTerminalMenuVisible] = useState(false);
   const [settingsReady, setSettingsReady] = useState(false);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [reconnectPending, setReconnectPending] = useState(false);
@@ -167,6 +173,7 @@ export default function App() {
   const transcription = useAudioTranscription();
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const shouldReconnectRef = useRef(false);
   const shouldResumeReconnectRef = useRef(false);
@@ -470,6 +477,19 @@ export default function App() {
   }, [pairingToken]);
 
   useEffect(() => {
+    if (!settingsLoadedRef.current) return;
+    if (commandHistory.length === 0) {
+      AsyncStorage.removeItem(STORAGE_KEYS.commandHistory).catch(() => {
+        // Ignore storage errors.
+      });
+      return;
+    }
+    AsyncStorage.setItem(STORAGE_KEYS.commandHistory, JSON.stringify(commandHistory)).catch(() => {
+      // Ignore storage errors.
+    });
+  }, [commandHistory]);
+
+  useEffect(() => {
     clientIdRef.current = clientId;
   }, [clientId]);
 
@@ -498,6 +518,7 @@ export default function App() {
         STORAGE_KEYS.activeSession,
         STORAGE_KEYS.connectionHistory,
         STORAGE_KEYS.terminalOutputs,
+        STORAGE_KEYS.commandHistory,
       ]);
       if (!active) return;
       const stored = Object.fromEntries(entries);
@@ -823,10 +844,23 @@ export default function App() {
             return { serverUrl, pairingToken };
           }
         }
-      } catch {
-        // Ignore malformed JSON payloads.
+        } catch {
+          // Ignore malformed JSON payloads.
+        }
       }
-    }
+      const storedCommandHistory = stored[STORAGE_KEYS.commandHistory];
+      if (storedCommandHistory) {
+        try {
+          const parsed = JSON.parse(storedCommandHistory);
+          if (Array.isArray(parsed)) {
+            setCommandHistory(
+              parsed.filter((item) => typeof item === "string" && item.trim()).slice(0, COMMAND_HISTORY_LIMIT),
+            );
+          }
+        } catch {
+          // Ignore malformed JSON payloads.
+        }
+      }
 
     const parsedUrl = fromUrl(trimmed);
     if (parsedUrl && (parsedUrl.serverUrl || parsedUrl.pairingToken)) {
@@ -852,23 +886,27 @@ export default function App() {
     const parsed = parseQrPayload(payload);
     if (!parsed) {
       setScanError("Unrecognized QR code. Expected a URL or JSON payload.");
-      return false;
+      return null;
     }
     let applied = false;
     if (parsed.serverUrl) {
-      setServerUrl(normalizeUrl(parsed.serverUrl));
+      const normalized = normalizeUrl(parsed.serverUrl);
+      serverUrlRef.current = normalized;
+      setServerUrl(normalized);
       applied = true;
     }
     if (parsed.pairingToken) {
-      setPairingToken(parsed.pairingToken.trim());
+      const trimmedToken = parsed.pairingToken.trim();
+      pairingTokenRef.current = trimmedToken;
+      setPairingToken(trimmedToken);
       applied = true;
     }
     if (!applied) {
       setScanError("QR code did not include a URL or token.");
-      return false;
+      return null;
     }
     setScanError(null);
-    return true;
+    return parsed;
   };
 
   const resetScannerError = () => {
@@ -892,9 +930,13 @@ export default function App() {
   const handleQrScanned = ({ data }: { data: string }) => {
     if (scanLockRef.current) return;
     scanLockRef.current = true;
-    const applied = applyQrPayload(data);
-    if (applied) {
+    const parsed = applyQrPayload(data);
+    if (parsed) {
       setScannerVisible(false);
+      setConnectionError(null);
+      if (connectionRef.current === "disconnected") {
+        connect();
+      }
       return;
     }
     if (scanResetTimerRef.current) {
@@ -1232,6 +1274,12 @@ export default function App() {
     reconnectTimerRef.current = null;
   };
 
+  const clearConnectTimeout = () => {
+    if (!connectTimeoutRef.current) return;
+    clearTimeout(connectTimeoutRef.current);
+    connectTimeoutRef.current = null;
+  };
+
   const blockReconnect = (reason: string) => {
     reconnectBlockedRef.current = reason;
     blockedTokenRef.current = pairingTokenRef.current.trim();
@@ -1302,9 +1350,11 @@ export default function App() {
     }
     invalidTokenHandledRef.current = false;
     setSessionsLoaded(false);
+    setConnectionError(null);
     shouldReconnectRef.current = true;
     setReconnectPending(true);
     clearReconnectTimer();
+    clearConnectTimeout();
     const rawUrl = serverUrlRef.current;
     const resolvedUrl = buildWsUrl(rawUrl, pairingTokenRef.current);
     const normalized = normalizeUrl(rawUrl);
@@ -1316,10 +1366,20 @@ export default function App() {
     updateConnection("connecting");
     const socket = new WebSocket(resolvedUrl);
     socketRef.current = socket;
+    connectTimeoutRef.current = setTimeout(() => {
+      if (socketRef.current !== socket) return;
+      pushLog("Connection timed out");
+      setConnectionError("Connection timed out. Check server URL and pairing token.");
+      setReconnectPending(false);
+      updateConnection("disconnected");
+      socket.close();
+    }, 10000);
 
     socket.onopen = () => {
       if (socketRef.current !== socket) return;
+      clearConnectTimeout();
       updateConnection("connected");
+      setConnectionError(null);
       updateConnectionHistory(serverUrlRef.current, pairingTokenRef.current);
       reconnectAttemptsRef.current = 0;
       reconnectBlockedRef.current = null;
@@ -1447,8 +1507,11 @@ export default function App() {
 
     socket.onclose = (event) => {
       if (socketRef.current !== socket) return;
+      const wasConnecting = connectionRef.current === "connecting";
+      clearConnectTimeout();
       socketRef.current = null;
       updateConnection("disconnected");
+      setReconnectPending(false);
       setDeviceId(null);
       subscribedSessionRef.current = null;
       setSessionsLoaded(false);
@@ -1456,6 +1519,9 @@ export default function App() {
       setIdeProgress([]);
       const reason = event.reason ? `: ${event.reason}` : "";
       pushLog(`Socket disconnected (${event.code}${reason})`);
+      if (wasConnecting && !connectionError) {
+        setConnectionError("Unable to connect. Check server URL and pairing token.");
+      }
       if (isInvalidTokenText(event.reason)) {
         handleInvalidToken(event.reason);
         return;
@@ -1465,8 +1531,12 @@ export default function App() {
 
     socket.onerror = (event) => {
       if (socketRef.current !== socket) return;
+      clearConnectTimeout();
       const message = "message" in event ? String((event as { message?: string }).message ?? "") : "";
       pushLog(message ? `Socket error: ${message}` : "Socket error");
+      if (message) {
+        setConnectionError(`Socket error: ${message}`);
+      }
     };
   };
 
@@ -1475,8 +1545,10 @@ export default function App() {
     shouldReconnectRef.current = false;
     autoConnectAttemptedRef.current = true;
     setReconnectPending(false);
+    setConnectionError(null);
     reconnectAttemptsRef.current = 0;
     clearReconnectTimer();
+    clearConnectTimeout();
     pendingSendsRef.current = [];
     socketRef.current?.close();
     socketRef.current = null;
@@ -1550,12 +1622,22 @@ export default function App() {
     if (connectionRef.current !== "connected") return;
     send({ type: "terminal_snapshot", sessionId, lines: 200 });
   };
+  const recordCommandHistory = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    setCommandHistory((prev) => {
+      const filtered = prev.filter((entry) => entry !== trimmed);
+      const next = [trimmed, ...filtered];
+      return next.slice(0, COMMAND_HISTORY_LIMIT);
+    });
+  };
   const sendCommand = (appendNewline: boolean) => {
     if (connectionRef.current !== "connected") return;
     if (transcription.isRecording) return;
     if (!activeSessionId) return;
     const data = command;
     if (!data.trim()) return;
+    recordCommandHistory(data);
     const payload = appendNewline ? `${data}\r` : data;
     send({ type: "terminal_input", sessionId: activeSessionId, data: payload });
     setCommand("");
@@ -1610,6 +1692,7 @@ export default function App() {
   const activeSession = displayActiveSessionId
     ? displaySessions.find((session) => session.id === displayActiveSessionId) ?? null
     : null;
+  const canUseTerminalActions = canInteract && activeSession != null;
   const shouldSuggestQuickKeys = useMemo(() => {
     if (!showCursor) return false;
     const tail = filteredOutput.slice(-400);
@@ -1680,7 +1763,7 @@ export default function App() {
     : THEME.colors.text;
   const micStatus = (() => {
     if (!transcription.isSupported) {
-      return "Voice input is only available on device builds.";
+      return "";
     }
     if (transcription.permissionState === "denied") {
       return "Microphone permission denied. Enable it in settings.";
@@ -1706,6 +1789,18 @@ export default function App() {
       requestAnimationFrame(() => scrollOutputToEnd(false));
     }
   }, [displayActiveSessionId]);
+
+  useEffect(() => {
+    if (!canUseTerminalActions) {
+      setTerminalMenuVisible(false);
+    }
+  }, [canUseTerminalActions]);
+
+  useEffect(() => {
+    if (activeTab !== "terminal") {
+      setTerminalMenuVisible(false);
+    }
+  }, [activeTab]);
 
   const clampFraction = (value?: number | null) => {
     if (value == null || Number.isNaN(value)) return null;
@@ -1874,6 +1969,9 @@ export default function App() {
                   <Text style={styles.statusText}>{statusLabel}</Text>
                   {deviceId ? <Text style={styles.statusMeta}>ID {deviceId.slice(0, 6)}</Text> : null}
                 </View>
+                {connectionError ? (
+                  <Text style={styles.connectionError}>{connectionError}</Text>
+                ) : null}
               </View>
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Saved connections</Text>
@@ -1986,12 +2084,65 @@ export default function App() {
           </SafeAreaView>
         </LinearGradient>
       </Modal>
+      <Modal
+        visible={commandHistoryVisible}
+        animationType={Platform.OS === "ios" ? "slide" : "fade"}
+        presentationStyle={Platform.OS === "ios" ? "pageSheet" : "fullScreen"}
+        onRequestClose={() => setCommandHistoryVisible(false)}
+      >
+        <LinearGradient
+          colors={[
+            THEME.colors.backgroundTop,
+            THEME.colors.backgroundMid,
+            THEME.colors.backgroundBottom,
+          ]}
+          style={styles.modalContainer}
+        >
+          <SafeAreaView style={styles.modalSafeArea}>
+            <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
+              <View style={styles.card}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.cardTitle}>Command history</Text>
+                  <Pressable
+                    style={styles.modalCloseButton}
+                    onPress={() => setCommandHistoryVisible(false)}
+                  >
+                    <Text style={styles.modalCloseText}>Close</Text>
+                  </Pressable>
+                </View>
+                {commandHistory.length === 0 ? (
+                  <Text style={styles.muted}>No commands yet.</Text>
+                ) : (
+                  <View style={styles.historyList}>
+                    {commandHistory.map((entry, index) => (
+                      <Pressable
+                        key={`${entry}-${index}`}
+                        style={styles.commandHistoryItem}
+                        onPress={() => {
+                          setCommand(entry);
+                          setCommandHistoryVisible(false);
+                        }}
+                      >
+                        <Text style={styles.commandHistoryText} numberOfLines={2}>
+                          {entry}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                )}
+              </View>
+            </ScrollView>
+          </SafeAreaView>
+        </LinearGradient>
+      </Modal>
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.screen}>
           <ScrollView contentContainerStyle={styles.content}>
             <View style={styles.headerRow}>
               <View style={styles.headerText}>
-                <Text style={styles.title}>IntelliJ Tunnel</Text>
+                <Text style={styles.title}>
+                  <Text style={styles.titleAccent}>In</Text>Tunnel
+                </Text>
                 <Text style={styles.subtitle}>Pair to your IDE and keep builds in your pocket.</Text>
               </View>
               <Pressable
@@ -2006,32 +2157,87 @@ export default function App() {
 
             {activeTab === "terminal" ? (
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Terminal</Text>
+                <View style={styles.cardHeaderRow}>
+                  <Text style={styles.cardTitle}>Terminal</Text>
+                  <Pressable
+                    style={[
+                      styles.menuButton,
+                      !canUseTerminalActions && styles.menuButtonDisabled,
+                    ]}
+                    onPress={() => setTerminalMenuVisible((prev) => !prev)}
+                    disabled={!canUseTerminalActions}
+                    accessibilityLabel="Terminal actions"
+                  >
+                    <View style={styles.menuDots}>
+                      <View style={styles.menuDot} />
+                      <View style={styles.menuDot} />
+                      <View style={styles.menuDot} />
+                    </View>
+                  </Pressable>
+                </View>
+                {terminalMenuVisible && canUseTerminalActions ? (
+                  <View style={styles.terminalMenu}>
+                    <Pressable
+                      style={styles.terminalMenuItem}
+                      onPress={() => {
+                        if (!activeSession) return;
+                        setTerminalMenuVisible(false);
+                        requestSnapshot(activeSession.id);
+                      }}
+                    >
+                      <Text style={styles.terminalMenuItemText}>Refresh output</Text>
+                    </Pressable>
+                    <Pressable
+                      style={styles.terminalMenuItem}
+                      onPress={() => {
+                        if (!activeSession) return;
+                        setTerminalMenuVisible(false);
+                        closeSession(activeSession.id);
+                      }}
+                    >
+                      <Text style={[styles.terminalMenuItemText, styles.terminalMenuItemDangerText]}>
+                        Close
+                      </Text>
+                    </Pressable>
+                  </View>
+                ) : null}
                 {!isLoading && (canInteract || showCachedContent) ? (
                   <ScrollView
                     horizontal
                     showsHorizontalScrollIndicator={false}
                     contentContainerStyle={styles.tabsRow}
                   >
-                    {displaySessions.map((session) => (
-                      <Pressable
-                        key={session.id}
-                        style={[
-                          styles.tab,
-                          displayActiveSessionId === session.id && styles.tabActive,
-                        ]}
-                        onPress={() => {
-                          setActiveSessionId(session.id);
-                          if (canInteract) {
-                            requestSnapshot(session.id);
-                          }
-                        }}
-                      >
-                        <Text style={styles.tabTitle} numberOfLines={1}>
-                          {session.name}
-                        </Text>
-                      </Pressable>
-                    ))}
+                    {displaySessions.map((session) => {
+                      const isActive = displayActiveSessionId === session.id;
+                      return (
+                        <View key={session.id} style={[styles.tab, isActive && styles.tabActive]}>
+                          <Pressable
+                            style={styles.tabMain}
+                            onPress={() => {
+                              setActiveSessionId(session.id);
+                              if (canInteract) {
+                                requestSnapshot(session.id);
+                              }
+                            }}
+                            accessibilityLabel={`Open ${session.name}`}
+                          >
+                            <Text style={styles.tabTitle} numberOfLines={1}>
+                              {session.name}
+                            </Text>
+                          </Pressable>
+                          {canInteract ? (
+                            <Pressable
+                              style={styles.tabClose}
+                              onPress={() => closeSession(session.id)}
+                              accessibilityLabel={`Close ${session.name}`}
+                              hitSlop={8}
+                            >
+                              <Text style={styles.tabCloseText}>x</Text>
+                            </Pressable>
+                          ) : null}
+                        </View>
+                      );
+                    })}
                     {canInteract ? (
                       <Pressable style={[styles.tab, styles.tabAdd]} onPress={startSession}>
                         <Text style={styles.tabAddText}>+</Text>
@@ -2107,14 +2313,25 @@ export default function App() {
                       </View>
                       {canInteract ? (
                         <View style={styles.quickKeysToggleRow}>
-                          <Pressable
-                            style={[styles.quickKeysToggle, quickKeysPinned && styles.quickKeysToggleActive]}
-                            onPress={() => setQuickKeysPinned((prev) => !prev)}
-                          >
-                            <Text style={styles.quickKeysToggleText}>
-                              {quickKeysPinned ? "Hide keys" : "Show keys"}
-                            </Text>
-                          </Pressable>
+                          <View style={styles.quickKeysToggleGroup}>
+                            <Pressable
+                              style={[styles.quickKeysToggle, quickKeysPinned && styles.quickKeysToggleActive]}
+                              onPress={() => setQuickKeysPinned((prev) => !prev)}
+                            >
+                              <Text style={styles.quickKeysToggleText}>
+                                {quickKeysPinned ? "Hide keys" : "Show keys"}
+                              </Text>
+                            </Pressable>
+                            <Pressable
+                              style={[
+                                styles.quickKeysToggle,
+                                commandHistoryVisible && styles.quickKeysToggleActive,
+                              ]}
+                              onPress={() => setCommandHistoryVisible(true)}
+                            >
+                              <Text style={styles.quickKeysToggleText}>History</Text>
+                            </Pressable>
+                          </View>
                           {shouldSuggestQuickKeys && !quickKeysPinned ? (
                             <Text style={styles.quickKeysHint}>Prompt detected</Text>
                           ) : null}
@@ -2143,22 +2360,6 @@ export default function App() {
                         </Text>
                       ) : null}
                     </View>
-                    {canInteract ? (
-                      <View style={styles.sessionActionRow}>
-                        <Pressable
-                          style={[styles.button, styles.buttonDangerOutline, styles.sessionActionButton]}
-                          onPress={() => closeSession(activeSession.id)}
-                        >
-                          <Text style={styles.buttonText}>Close</Text>
-                        </Pressable>
-                        <Pressable
-                          style={[styles.button, styles.buttonSecondary, styles.sessionActionButton]}
-                          onPress={() => requestSnapshot(activeSession.id)}
-                        >
-                          <Text style={styles.buttonText}>Refresh output</Text>
-                        </Pressable>
-                      </View>
-                    ) : null}
                   </>
                 ) : (
                   <Text style={styles.muted}>{emptyTerminalMessage}</Text>
@@ -2398,6 +2599,9 @@ const styles = StyleSheet.create({
     fontSize: 34,
     color: THEME.colors.text,
     letterSpacing: 0.4,
+  },
+  titleAccent: {
+    color: THEME.colors.primary,
   },
   subtitle: {
     fontFamily: "SpaceGrotesk_500Medium",
@@ -2808,6 +3012,13 @@ const styles = StyleSheet.create({
     color: THEME.colors.muted,
     marginLeft: 6,
   },
+  connectionError: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.danger,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 6,
+  },
   muted: {
     fontFamily: "SpaceGrotesk_500Medium",
     color: THEME.colors.muted,
@@ -2825,16 +3036,39 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: THEME.colors.cardBorder,
     backgroundColor: "rgba(15, 23, 42, 0.65)",
-    gap: 4,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   tabActive: {
     borderColor: THEME.colors.primary,
     backgroundColor: "rgba(249, 115, 22, 0.18)",
   },
+  tabMain: {
+    flex: 1,
+    justifyContent: "center",
+  },
   tabTitle: {
     fontFamily: "SpaceGrotesk_700Bold",
     color: THEME.colors.text,
     fontSize: 13,
+    flexShrink: 1,
+  },
+  tabClose: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: "rgba(239, 68, 68, 0.5)",
+    backgroundColor: "rgba(239, 68, 68, 0.15)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tabCloseText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.danger,
+    fontSize: 12,
+    lineHeight: 14,
   },
   tabAdd: {
     minWidth: 52,
@@ -2887,6 +3121,11 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 10,
   },
+  quickKeysToggleGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
   quickKeysToggle: {
     paddingHorizontal: 12,
     paddingVertical: 6,
@@ -2908,6 +3147,65 @@ const styles = StyleSheet.create({
     fontFamily: "SpaceGrotesk_500Medium",
     color: THEME.colors.warning,
     fontSize: 12,
+  },
+  menuButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.6)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  menuButtonDisabled: {
+    opacity: 0.5,
+  },
+  menuDots: {
+    flexDirection: "row",
+    gap: 4,
+  },
+  menuDot: {
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: THEME.colors.text,
+  },
+  terminalMenu: {
+    alignSelf: "flex-end",
+    gap: 6,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.92)",
+    padding: 6,
+  },
+  terminalMenuItem: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+  },
+  terminalMenuItemText: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.text,
+    fontSize: 13,
+  },
+  terminalMenuItemDangerText: {
+    color: THEME.colors.danger,
+  },
+  commandHistoryItem: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.75)",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  commandHistoryText: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.text,
+    fontSize: 13,
+    lineHeight: 18,
   },
   quickKeysRow: {
     gap: 8,
@@ -2972,15 +3270,6 @@ const styles = StyleSheet.create({
   },
   micStatusError: {
     color: THEME.colors.danger,
-  },
-  sessionActionRow: {
-    flexDirection: "row",
-    gap: 10,
-    flexWrap: "wrap",
-  },
-  sessionActionButton: {
-    flex: 1,
-    alignItems: "center",
   },
   bottomBar: {
     paddingHorizontal: 16,
@@ -3054,10 +3343,5 @@ const styles = StyleSheet.create({
     fontFamily: "SpaceGrotesk_500Medium",
     color: THEME.colors.muted,
     paddingVertical: 2,
-  },
-  buttonDangerOutline: {
-    borderWidth: 1,
-    borderColor: "rgba(239, 68, 68, 0.7)",
-    backgroundColor: "rgba(239, 68, 68, 0.15)",
   },
 });

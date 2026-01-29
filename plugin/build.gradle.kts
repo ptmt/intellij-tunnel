@@ -3,7 +3,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.10.5"
 }
 
-group = "com.intellij.tunnel"
+group = "com.potomushto.intunnel"
 version = "0.1.0"
 
 repositories {
