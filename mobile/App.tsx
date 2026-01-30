@@ -2477,7 +2477,7 @@ export default function App() {
               <View style={styles.card}>
                 <View style={styles.cardHeaderRow}>
                   <View style={styles.cardHeaderText}>
-                    <Text style={styles.cardTitle}>Builds</Text>
+                    <Text style={styles.cardTitle}>Control</Text>
                     <Text style={styles.muted}>Status: {buildStatusLabel}</Text>
                   </View>
                   <Pressable
@@ -2687,7 +2687,7 @@ export default function App() {
                       activeTab === "builds" && styles.bottomTabTextActive,
                     ]}
                   >
-                    Builds
+                    Control
                   </Text>
                   {hasBuildBadge ? (
                     buildStatusCount > 0 ? (
