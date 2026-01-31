@@ -1,0 +1,131 @@
+name: release-plugin
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Plugin version (e.g. 1.2.3). Overrides release tag when provided."
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build IntelliJ plugin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VERSION_INPUT="${{ inputs.version }}"
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [ -n "$TAG_NAME" ]; then
+            VERSION="$TAG_NAME"
+          elif [ -n "$VERSION_INPUT" ]; then
+            VERSION="$VERSION_INPUT"
+          else
+            echo "Version is required (release tag or workflow input)." >&2
+            exit 1
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Resolve build ref
+        id: build_ref
+        shell: bash
+        run: |
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [ -n "$TAG_NAME" ]; then
+            echo "ref=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.event.repository.default_branch }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Checkout release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.build_ref.outputs.ref }}
+          fetch-depth: 0
+          path: release-src
+      - name: Checkout default branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          path: repo
+      - name: Bump plugin version (release source)
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import os
+
+          version = os.environ["PLUGIN_VERSION"]
+          path = Path(os.environ["TARGET_DIR"]) / "plugin/build.gradle.kts"
+          text = path.read_text()
+          updated, count = re.subn(r'^(\\s*version\\s*=\\s*")([^"]+)(")', r'\\1' + version + r'\\3', text, flags=re.M)
+          if count != 1:
+              raise SystemExit(f"Expected to update 1 version line, updated {count}")
+          if updated != text:
+              path.write_text(updated)
+          PY
+        env:
+          PLUGIN_VERSION: ${{ steps.version.outputs.version }}
+          TARGET_DIR: release-src
+      - name: Bump plugin version (default branch)
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import os
+
+          version = os.environ["PLUGIN_VERSION"]
+          path = Path(os.environ["TARGET_DIR"]) / "plugin/build.gradle.kts"
+          text = path.read_text()
+          updated, count = re.subn(r'^(\\s*version\\s*=\\s*")([^"]+)(")', r'\\1' + version + r'\\3', text, flags=re.M)
+          if count != 1:
+              raise SystemExit(f"Expected to update 1 version line, updated {count}")
+          if updated != text:
+              path.write_text(updated)
+          PY
+        env:
+          PLUGIN_VERSION: ${{ steps.version.outputs.version }}
+          TARGET_DIR: repo
+      - name: Commit version bump
+        shell: bash
+        run: |
+          if git -C repo diff --quiet; then
+            echo "No version change to commit."
+            exit 0
+          fi
+          git -C repo config user.name "github-actions[bot]"
+          git -C repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C repo add plugin/build.gradle.kts
+          git -C repo commit -m "chore: bump plugin version to ${{ steps.version.outputs.version }}"
+          git -C repo push origin HEAD:${{ github.event.repository.default_branch }}
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build plugin
+        working-directory: release-src/plugin
+        run: |
+          chmod +x ./gradlew
+          ./gradlew buildPlugin
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-src/plugin/build/distributions/*.zip
+      - name: Upload workflow artifacts
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: intellij-plugin
+          path: release-src/plugin/build/distributions/*.zip
