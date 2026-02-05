@@ -74,47 +74,28 @@ jobs:
           elif [ -n "$INPUT_VERSION" ]; then
             BASE_VERSION="$INPUT_VERSION"
           else
-            BASE_VERSION="$(python - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path("release-src/plugin/gradle.properties")
-          if not path.exists():
-              raise SystemExit(
-                  f"Version is required (release tag, workflow input, or missing {path})."
-              )
-          data = path.read_bytes()
-          text = None
-          for enc in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
-              try:
-                  text = data.decode(enc)
-                  break
-              except UnicodeDecodeError:
-                  continue
-          if text is None:
-              text = data.decode("utf-8", errors="ignore")
-          text = text.replace("\\ufeff", "").replace("\\u00a0", " ")
-          version = None
-          for raw_line in text.splitlines():
-              line = raw_line.strip()
-              if not line or line.startswith("#") or line.startswith("!"):
-                  continue
-              if "=" in line:
-                  key, value = line.split("=", 1)
-              elif ":" in line:
-                  key, value = line.split(":", 1)
-              else:
-                  continue
-              if key.strip() == "pluginVersion":
-                  version = value.strip().strip("'").strip('"')
-                  break
-          if not version:
-              raise SystemExit(
-                  "Version is required (release tag, workflow input, or plugin/gradle.properties)."
-              )
-          print(version)
-          PY
+            if [ ! -f release-src/plugin/gradle.properties ]; then
+              echo "Version is required (release tag, workflow input, or missing release-src/plugin/gradle.properties)." >&2
+              exit 1
+            fi
+            BASE_VERSION="$(
+              awk -F'=' '
+                /^[[:space:]]*pluginVersion[[:space:]]*=/ {
+                  value=$2
+                  for (i=3; i<=NF; i++) value=value"="$i
+                  gsub(/\r/, "", value)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                  gsub(/^\"|\"$/, "", value)
+                  gsub(/^'\''|'\''$/, "", value)
+                  print value
+                  exit
+                }
+              ' release-src/plugin/gradle.properties
             )"
+            if [ -z "$BASE_VERSION" ]; then
+              echo "Version is required (release tag, workflow input, or plugin/gradle.properties)." >&2
+              exit 1
+            fi
           fi
           BASE_VERSION="${BASE_VERSION#v}"
           if [ -z "$BASE_VERSION" ]; then
@@ -126,10 +107,11 @@ jobs:
           import os
           import re
 
-          base = os.environ["BASE_VERSION"].strip()
-          match = re.match(r'^(\\d+)\\.(\\d+)\\.(\\d+)(?:[.-].*)?$', base)
+          base_raw = os.environ["BASE_VERSION"]
+          base = base_raw.replace("\\ufeff", "").replace("\\u00a0", " ").strip()
+          match = re.search(r'(\\d+)\\.(\\d+)\\.(\\d+)', base)
           if not match:
-              raise SystemExit(f"Base version must look like X.Y.Z, got: {base}")
+              raise SystemExit(f"Base version must look like X.Y.Z, got: {base!r}")
           major, minor, patch = (int(part) for part in match.groups())
           print(f"{major}.{minor}.{patch + 1}")
           PY
