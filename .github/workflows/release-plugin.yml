@@ -62,15 +62,36 @@ jobs:
               raise SystemExit(
                   f"Version is required (release tag, workflow input, or missing {path})."
               )
-          text = path.read_text(encoding="utf-8")
-          if text.startswith("\\ufeff"):
-              text = text.lstrip("\\ufeff")
-          match = re.search(r'^\\s*pluginVersion\\s*=\\s*([^\\s#]+)', text, flags=re.M)
-          if not match:
+          data = path.read_bytes()
+          text = None
+          for enc in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
+              try:
+                  text = data.decode(enc)
+                  break
+              except UnicodeDecodeError:
+                  continue
+          if text is None:
+              text = data.decode("utf-8", errors="ignore")
+          text = text.replace("\\ufeff", "").replace("\\u00a0", " ")
+          version = None
+          for raw_line in text.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#") or line.startswith("!"):
+                  continue
+              if "=" in line:
+                  key, value = line.split("=", 1)
+              elif ":" in line:
+                  key, value = line.split(":", 1)
+              else:
+                  continue
+              if key.strip() == "pluginVersion":
+                  version = value.strip().strip("'").strip('"')
+                  break
+          if not version:
               raise SystemExit(
                   "Version is required (release tag, workflow input, or plugin/gradle.properties)."
               )
-          print(match.group(1))
+          print(version)
           PY
             )"
           fi
