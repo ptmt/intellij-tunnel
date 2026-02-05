@@ -3,6 +3,13 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, SHA) to build. Defaults to the workflow ref."
+        required: false
+      base_version:
+        description: "Base version (X.Y.Z) or tag name (vX.Y.Z) used if no release tag is present."
+        required: false
 
 jobs:
   build:
@@ -15,8 +22,11 @@ jobs:
         id: build_ref
         shell: bash
         run: |
+          REF_INPUT="${{ inputs.ref }}"
           TAG_NAME="${{ github.event.release.tag_name }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ -n "$REF_INPUT" ]; then
+            echo "ref=$REF_INPUT" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
           elif [ -n "$TAG_NAME" ]; then
             echo "ref=$TAG_NAME" >> "$GITHUB_OUTPUT"
@@ -34,25 +44,35 @@ jobs:
         shell: bash
         run: |
           TAG_NAME="${{ github.event.release.tag_name }}"
+          INPUT_VERSION="${{ inputs.base_version }}"
+          if [ -z "$TAG_NAME" ] && [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG_NAME="${{ github.ref_name }}"
+          fi
           if [ -n "$TAG_NAME" ]; then
             BASE_VERSION="$TAG_NAME"
+          elif [ -n "$INPUT_VERSION" ]; then
+            BASE_VERSION="$INPUT_VERSION"
           else
             BASE_VERSION="$(python - <<'PY'
           from pathlib import Path
           import re
 
           path = Path("release-src/plugin/gradle.properties")
-          text = path.read_text()
+          if not path.exists():
+              raise SystemExit(f"Version is required (release tag, workflow input, or missing {path}).")
+          text = path.read_text(encoding="utf-8")
+          if text.startswith("\\ufeff"):
+              text = text.lstrip("\\ufeff")
           match = re.search(r'^\\s*pluginVersion\\s*=\\s*([^\\s#]+)', text, flags=re.M)
           if not match:
-              raise SystemExit("Version is required (release tag or gradle.properties).")
+              raise SystemExit(f"Version is required (release tag, workflow input, or {path}).")
           print(match.group(1))
           PY
             )"
           fi
           BASE_VERSION="${BASE_VERSION#v}"
           if [ -z "$BASE_VERSION" ]; then
-            echo "Base version is required (release tag or gradle.properties)." >&2
+            echo "Base version is required (release tag, workflow input, or gradle.properties)." >&2
             exit 1
           fi
           export BASE_VERSION
@@ -85,11 +105,14 @@ jobs:
 
           version = os.environ["PLUGIN_VERSION"]
           path = Path(os.environ["TARGET_DIR"]) / "plugin/gradle.properties"
-          text = path.read_text()
+          text = path.read_text() if path.exists() else ""
           updated, count = re.subn(r'^(\\s*pluginVersion\\s*=\\s*)([^\\s#]+)', r'\\1' + version, text, flags=re.M)
+          if count == 0:
+              updated = f"pluginVersion={version}\\n{text}"
+              count = 1
           if count != 1:
               raise SystemExit(f"Expected to update 1 version line, updated {count}")
-          if updated != text:
+          if updated != text or not path.exists():
               path.write_text(updated)
           PY
         env:
@@ -105,11 +128,14 @@ jobs:
 
           version = os.environ["PLUGIN_VERSION"]
           path = Path(os.environ["TARGET_DIR"]) / "plugin/gradle.properties"
-          text = path.read_text()
+          text = path.read_text() if path.exists() else ""
           updated, count = re.subn(r'^(\\s*pluginVersion\\s*=\\s*)([^\\s#]+)', r'\\1' + version, text, flags=re.M)
+          if count == 0:
+              updated = f"pluginVersion={version}\\n{text}"
+              count = 1
           if count != 1:
               raise SystemExit(f"Expected to update 1 version line, updated {count}")
-          if updated != text:
+          if updated != text or not path.exists():
               path.write_text(updated)
           PY
         env:
