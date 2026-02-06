@@ -39,84 +39,17 @@ jobs:
           ref: ${{ steps.build_ref.outputs.ref }}
           fetch-depth: 0
           path: release-src
-      - name: Debug release source
-        shell: bash
-        run: |
-          echo "PWD: $(pwd)"
-          echo "Contents of workspace:"
-          ls -la
-          echo "Contents of release-src:"
-          ls -la release-src || true
-          echo "Contents of release-src/plugin:"
-          ls -la release-src/plugin || true
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("release-src/plugin/gradle.properties")
-          print(f"gradle.properties exists: {path.exists()}")
-          if path.exists():
-              data = path.read_bytes()
-              print(f"gradle.properties size: {len(data)} bytes")
-              print("First 200 bytes repr:")
-              print(repr(data[:200]))
-          PY
       - name: Resolve version
         id: version
         shell: bash
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.base_version }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG_NAME="${{ github.event.release.tag_name }}"
-          INPUT_VERSION="${{ inputs.base_version }}"
-          if [ -z "$TAG_NAME" ] && [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.ref_type }}" = "tag" ]; then
-            TAG_NAME="${{ github.ref_name }}"
-          fi
-          if [ -n "$TAG_NAME" ]; then
-            BASE_VERSION="$TAG_NAME"
-          elif [ -n "$INPUT_VERSION" ]; then
-            BASE_VERSION="$INPUT_VERSION"
-          else
-            if [ ! -f release-src/plugin/gradle.properties ]; then
-              echo "Version is required (release tag, workflow input, or missing release-src/plugin/gradle.properties)." >&2
-              exit 1
-            fi
-            BASE_VERSION="$(
-              awk -F'=' '
-                /^[[:space:]]*pluginVersion[[:space:]]*=/ {
-                  value=$2
-                  for (i=3; i<=NF; i++) value=value"="$i
-                  gsub(/\r/, "", value)
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                  gsub(/^\"|\"$/, "", value)
-                  gsub(/^'\''|'\''$/, "", value)
-                  print value
-                  exit
-                }
-              ' release-src/plugin/gradle.properties
-            )"
-            if [ -z "$BASE_VERSION" ]; then
-              echo "Version is required (release tag, workflow input, or plugin/gradle.properties)." >&2
-              exit 1
-            fi
-          fi
-          BASE_VERSION="${BASE_VERSION#v}"
-          if [ -z "$BASE_VERSION" ]; then
-            echo "Base version is required (release tag, workflow input, or plugin/gradle.properties)." >&2
-            exit 1
-          fi
-          export BASE_VERSION
-          VERSION="$(python - <<'PY'
-          import os
-          import re
-
-          base_raw = os.environ["BASE_VERSION"]
-          base = base_raw.replace("\\ufeff", "").replace("\\u00a0", " ").strip()
-          match = re.search(r'(\\d+)\\.(\\d+)\\.(\\d+)', base)
-          if not match:
-              raise SystemExit(f"Base version must look like X.Y.Z, got: {base!r}")
-          major, minor, patch = (int(part) for part in match.groups())
-          print(f"{major}.{minor}.{patch + 1}")
-          PY
-          )"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          bash release-src/verify.sh
       - name: Checkout default branch
         uses: actions/checkout@v5
         with:
