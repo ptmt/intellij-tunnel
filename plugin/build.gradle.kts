@@ -75,12 +75,32 @@ fun sanitizeManifestFile(manifestFile: File) {
     manifestFile.writeText(sanitized)
 }
 
+fun debugManifestFile(manifestFile: File, label: String) {
+    if (!manifestFile.exists()) {
+        return
+    }
+    val data = manifestFile.readBytes()
+    val preview = data.take(200).toByteArray().contentToString()
+    println("MANIFEST_DEBUG [$label] ${manifestFile.absolutePath} size=${data.size} bytes preview=$preview")
+}
+
 tasks.withType<Jar>().configureEach {
     doFirst {
-        val generatedManifest = layout.buildDirectory.file("tmp/generateManifest/MANIFEST.MF").get().asFile
-        sanitizeManifestFile(generatedManifest)
-        val jarManifest = layout.buildDirectory.file("tmp/jar/MANIFEST.MF").get().asFile
-        sanitizeManifestFile(jarManifest)
+        val manifestPaths = listOf(
+            "tmp/generateManifest/MANIFEST.MF",
+            "tmp/jar/MANIFEST.MF",
+            "tmp/instrumentedJar/MANIFEST.MF",
+            "tmp/composedJar/MANIFEST.MF",
+            "tmp/jarSearchableOptions/MANIFEST.MF",
+        )
+        val debug = System.getenv("MANIFEST_DEBUG") == "1"
+        for (relativePath in manifestPaths) {
+            val manifestFile = layout.buildDirectory.file(relativePath).get().asFile
+            if (debug) {
+                debugManifestFile(manifestFile, relativePath)
+            }
+            sanitizeManifestFile(manifestFile)
+        }
     }
 }
 
