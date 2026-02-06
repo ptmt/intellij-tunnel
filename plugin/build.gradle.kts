@@ -57,3 +57,21 @@ intellijPlatform {
 kotlin {
     jvmToolchain(17)
 }
+
+tasks.named("generateManifest").configure {
+    doLast {
+        val manifestFile = layout.buildDirectory.file("tmp/generateManifest/MANIFEST.MF").get().asFile
+        if (!manifestFile.exists()) {
+            return@doLast
+        }
+        val lines = manifestFile.readLines()
+        val firstNonEmpty = lines.firstOrNull { it.isNotBlank() } ?: return@doLast
+        if (!firstNonEmpty.startsWith(" ")) {
+            return@doLast
+        }
+        val fixed = lines.map { line ->
+            if (line.startsWith(" ")) line.drop(1) else line
+        }
+        manifestFile.writeText(fixed.joinToString("\n") + "\n")
+    }
+}

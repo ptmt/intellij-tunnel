@@ -41,20 +41,20 @@ else
   fi
 fi
 
+base_version="$(printf '%s' "$base_version" | tr -d '\r' | tr -d '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
 base_version="${base_version#v}"
 if [ -z "$base_version" ]; then
   echo "Base version is required (release tag, workflow input, or plugin/gradle.properties)." >&2
   exit 1
 fi
 
-if [[ "$base_version" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-  major="${BASH_REMATCH[1]}"
-  minor="${BASH_REMATCH[2]}"
-  patch="${BASH_REMATCH[3]}"
-else
-  echo "Base version must look like X.Y.Z, got: '$base_version'" >&2
+base_version_match="$(printf '%s' "$base_version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+if [ -z "$base_version_match" ]; then
+  printf "Base version must look like X.Y.Z, got: '%s'\n" "$base_version" >&2
   exit 1
 fi
+
+IFS='.' read -r major minor patch <<<"$base_version_match"
 
 version="$major.$minor.$((patch + 1))"
 echo "$version"
