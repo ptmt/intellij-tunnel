@@ -1,3 +1,5 @@
+import org.gradle.jvm.tasks.Jar
+
 plugins {
     kotlin("jvm") version "2.3.0"
     id("org.jetbrains.intellij.platform") version "2.10.5"
@@ -54,24 +56,28 @@ intellijPlatform {
     }
 }
 
-kotlin {
-    jvmToolchain(17)
+fun sanitizeManifestFile(manifestFile: File) {
+    if (!manifestFile.exists()) {
+        return
+    }
+    val lines = manifestFile.readLines()
+    val firstNonEmpty = lines.firstOrNull { it.isNotBlank() } ?: return
+    if (!firstNonEmpty.startsWith(" ")) {
+        return
+    }
+    val fixed = lines.map { line ->
+        if (line.startsWith(" ")) line.drop(1) else line
+    }
+    manifestFile.writeText(fixed.joinToString("\n") + "\n")
 }
 
-tasks.named("generateManifest").configure {
-    doLast {
+tasks.withType<Jar>().configureEach {
+    doFirst {
         val manifestFile = layout.buildDirectory.file("tmp/generateManifest/MANIFEST.MF").get().asFile
-        if (!manifestFile.exists()) {
-            return@doLast
-        }
-        val lines = manifestFile.readLines()
-        val firstNonEmpty = lines.firstOrNull { it.isNotBlank() } ?: return@doLast
-        if (!firstNonEmpty.startsWith(" ")) {
-            return@doLast
-        }
-        val fixed = lines.map { line ->
-            if (line.startsWith(" ")) line.drop(1) else line
-        }
-        manifestFile.writeText(fixed.joinToString("\n") + "\n")
+        sanitizeManifestFile(manifestFile)
     }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
